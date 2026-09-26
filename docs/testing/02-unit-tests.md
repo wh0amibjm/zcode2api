@@ -137,3 +137,23 @@
 | ZC-007 | 切换前保全 | 未入库的当前登录自动先快照 → 不丢号 | P0 |
 | ZC-008 | 路径穿越防护 | id 含 `../`/非法字符 → 拒绝 | P0 |
 | ZC-009 | ZCode 运行中热切换保护 | 检测到客户端运行 → 按 behavior 配置拒绝/杀进程 | P2 |
+
+## 10. IDENTITY — 身份 / 追踪头（identity.py / agent.py）
+
+Plan 通道追踪头形态是**风控相关的硬约束**，不是可自由调整的归因字段
+（2026-09-27 事故：给该通道加 `x-session-id` → 池内大面积 3012，见 `development/05 §9`）。
+
+| ID | 用例 | 输入 → 预期 | 优先级 |
+|----|------|-------------|--------|
+| IDN-001 | Plan 通道追踪头三件套 | JWT 账号 `build_request` → 含 `x-request-id` / `x-zcode-session-type` / `x-zcode-trace-id` | P0 |
+| IDN-002 | 事故头缺席 | 同上（含下游塞 `x-session-id` / `x-query-id`）→ 两者均不出现 | P0 |
+| IDN-003 | 追踪头每请求新值 | 连续两次 `build_request` → request-id / trace-id 均不同 | P1 |
+| IDN-004 | 通道差异反向锁 | `build_trace_headers(plan="coding-plan")` → 仍发 `x-query-id` / `x-session-id` | P1 |
+| IDN-005 | API Key 通道无追踪头 | apiKey 账号（含 force_fallback）→ 追踪头整族缺席 | P1 |
+| IDN-006 | 上游侧实证 | 集成：Mock 上游**实际收到**的头里无事故头、三件套在位（下游伪造的也不透传） | P0 |
+
+实现：`tests/unit/test_plan_channel_headers.py`（9 条，IDN-001..006）。
+IDN-002 / IDN-004 / IDN-006 已做变异验证（把 `x-session-id` 加回 start-plan 分支 → 变红）。
+
+> 身份头/指纹另见 `tests/unit/test_identity.py`（平台固定、透传黑名单、反代头剔除）；
+> 底座既有行为锁定见 `tests/unit/test_regression_baseline.py`。

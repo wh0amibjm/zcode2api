@@ -160,3 +160,72 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 ```
 
 `appVersion` 必须可打印 ASCII，非法值静默回退默认；`X-Device-Mid` 永不逐请求随机（防指纹抖动）。
+
+### 8.1 追踪头（通道相关，别按「官方发了就跟着发」推）
+
+| 通道 | `x-request-id` | `x-zcode-session-type` | `x-zcode-trace-id` | `x-query-id` / `x-session-id` |
+|------|----------------|------------------------|--------------------|-------------------------------|
+| **Plan（start-plan，Bearer JWT）** | ✅ 每请求新值 | ✅ `main` | ✅ 每请求新值 | ❌ **不发** |
+| API Key（coding-plan） | — | — | — | 按 zapi 记录会发（`build_trace_headers(plan="coding-plan")`） |
+
+- Plan 通道的追踪头**恒为三件套**。`x-query-id` / `x-session-id` 在该通道上是上游的
+  风控信号，不是可自由启用的缓存钥匙 —— 误发触发 3012（2026-09-27 事故，见 §9）。
+- 下游塞进来的同名头由 `agent._DROP_HEADERS` 剔除，不透传；客户端不发**不能**当作保证。
+- 生成点是 `identity.build_trace_headers()`，Plan 分支在 `agent.build_request()` 里调用。
+  `plan="coding-plan"` 分支当前**无调用点**（只保留了通道差异的记录），删改它不影响线上行为，
+  但它是那条差异的唯一落点 —— 要动先读 §9。
+- 「官方开源 CLI 对所有请求都发 `x-session-id`」**不构成**本通道可以发的依据：那是官方客户端
+  身份下的行为，与本网关镜像的 start-plan 形态在上游眼里不是一回事。
+- 同理，调研里对 coding-plan **签名路径**做的会话/缓存对照也只能停在它自己那条通道：那条路径上
+  `X-Session-Id` 是签名与 PoW 的输入（协议字段），端点是 `/api/coding/paas/v4/chat/completions`、
+  认证是 `Bearer <api_key>` —— 端点、认证、头集与 Plan 通道全不同。把它的结论搬过来，就是
+  2026-09-27 那次事故的直接原因。**跨通道外推不成立**，这比「结论本身对不对」更要紧。
+
+## 9. 事故档案（脱敏）
+
+按时间倒序。每条只记**机制、结论、回归锁定**：不写账号标识、凭证、主机名、路径与部署细节。
+结论必须落到可执行规则上并配回归用例 —— 否则同一个理由会被再犯一次。
+
+### 2026-09-27 — Plan 通道加 `x-session-id`，池内大面积 3012
+
+**动机**：官方开源 CLI（`zai-org/ZCode`，`runner-attribution.ts`）对每个模型请求都带
+`x-session-id`（会话级稳定）+ `x-query-id` + `x-request-id`，其注释说服务端靠这些头区分
+main/subagent/other。据此推断「start-plan 不发 `x-session-id`」这条旧结论已被**证伪**，
+并进一步假设上游**前缀缓存按 session 分桶**：固定 session 时 `cached_tokens` 从第 2 轮起稳定命中，
+随机则恒 miss。于是做了三件事：① Plan 通道改发会话级稳定的 `x-session-id` / `x-zcode-trace-id`
+（派生口径：下游鉴权身份 + model + system + 首条 user 消息的哈希；下游显式给 `X-Session-Id` 则采用）；
+② 加了按会话粘账号的调度（同一会话固定打同一账号，保住缓存分桶身份）；③ 留了
+`ZCODE_SESSION_HEADERS=0` 回退开关。
+
+**结果**：上线后**数分钟内**，池内绝大多数账号（12 个里 11 个）吃到
+`3012 unusual activity`（HTTP 405）。`Account.ban_for_risk()` 把命中账号置 `Status.DISABLED`，
+而该分支**按设计不自动恢复**（人工确认后才 `set_enabled`）—— 一次错误的头形态，换来一个人工恢复的号池。
+回滚（代码 + 重启 + 清风控计数）后，观察窗内未再见 3012。
+
+**结论**：
+
+1. 「官方客户端/官方开源实现发了这个头」≠「本网关可以发」。官方 CLI 是官方客户端身份；
+   本网关镜像的是 start-plan 请求形态。**跨实现推断头形态，必须先在网关自身形态上验证。**
+2. `x-session-id` / `x-query-id` 是 Plan 通道的**风控信号**，不是缓存钥匙。头形态见 §8.1。
+3. **缓存那条依据是跨通道错位引用**（比「没测过」更危险）：当时引用的「固定 session 从第 2 轮起
+   `cached_tokens` 确定性命中」，原始测量发生在 **coding-plan 签名路径**上 —— 端点
+   `/api/coding/paas/v4/chat/completions`、认证 `Bearer <api_key>`，而且 `X-Session-Id` 在那里
+   **是 Ed25519 签名与 PoW 的输入**（签名串与 `proof_of_work` 都含 `session_id`），即它是该通道的
+   **协议字段**，不是可以搬用的归因头。原始记录自身还标着「不是确定性开关」「分桶机制为推断、
+   未在客户端侧证实」，复跑出现过 3/5 的不稳定结果。⇒ 搬到 Plan 通道属于**跨通道外推**。
+   要论证本通道的缓存命中，先在**不改头形态**的前提下拿到可重复的 `cached_tokens` 对照数据。
+4. **回滚是止损，不是完整归因**：同批账号里有一个在事故窗口内仍正常服务过一轮，所以头形态
+   未必是唯一触发条件（并发量、身份指纹同样是候选）。若 3012 在回滚后复发，往身份头完整性与
+   并发方向查，别回头再咬这一行。
+5. 事故期间被 `ban_for_risk` 置 DISABLED 的账号**不会自愈**，回滚后需人工 `set_enabled`
+   并清 `risk_strikes` —— 排障时先看这两项，别把「禁用未恢复」误判成「还在被风控」。
+
+**回归锁定**：`tests/unit/test_plan_channel_headers.py`（9 条，含集成层断言**上游实际收到的头**）。
+已做变异验证：把 `x-session-id` 加回 `build_trace_headers()` 的 start-plan 分支，
+单测 `test_start_plan_branch_does_not` 与集成 `test_upstream_sees_no_incident_headers`
+等 5 条同时变红 —— 该守卫不是同义反复。
+
+**这次事故不成立的修法记录**（避免有人重走）：加头 + 会话粘性账号 + 回退开关这套改动本身
+在代码层面是自洽的，`_SESSION_AFFINITY` 的粘性路由与 `derive_session` 的派生口径也都能用；
+**错的只有「Plan 通道可以带这两个头」这一条前提**。要复用这份工作，只能用在被证明接受
+这两个头的通道上，且先在 §8.1 登记通道差异。
