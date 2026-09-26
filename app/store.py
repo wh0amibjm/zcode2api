@@ -3,8 +3,8 @@
 数据保存在项目本目录下的 data/accounts.db，采用 WAL 模式，
 与 grok2api 的本地 (local) 账号后端保持一致。
 
-运行期账号对象常驻内存（保证轮询游标与状态实时性），
-每次变更同步落库；进程启动时从 SQLite 读取快照。
+运行期账号对象常驻内存（保证轮询游标与状态实时性）；状态类变更同步落库，
+请求计数类变更走脏标记延刷（touch_account，5s 合并）；进程启动时从 SQLite 读取快照。
 """
 
 from __future__ import annotations
@@ -37,6 +37,9 @@ class Store:
         # 改动时也会撞上。data_version 是 SQLite 为此提供的机制。
         self._watch: sqlite3.Connection | None = None
         self._db_mtime: int = 0
+        # 热路径落库的脏标记与合并刷写定时器（见 touch_account）
+        self._dirty: set[str] = set()
+        self._flush_timer: threading.Timer | None = None
         self._init_db()
         # 常驻 watch 连接在这里就建好 —— `_init_db()` 已确保目录存在。惰性建的话，
         # 两个并发读者可能同时走到"发现是 None"那一步，各自建一条连接，其中一条被
@@ -341,6 +344,65 @@ class Store:
                 account.status = Status.ACTIVE
             self._persist_account(account)
             return True
+
+    # ── 热路径落库（脏标记 + 合并刷写）────────────────────────────────────────
+    # 成功路径曾对每个请求同步 update_account：全局 RLock + 新建 SQLite 连接 +
+    # 全量 JSON 序列化 + commit，全在事件循环线程上 —— 并发下所有请求的收尾在
+    # 这一点串行，还顺带卡住其他协程。计数类字段（use_count/last_used_at/
+    # recent_results/risk_strikes 清零）改为内存即时生效、5s 合并落库；进程退出
+    # 前未刷的最多丢 5s 计数，可接受。状态类变更（冷却/封禁/额度/启停）仍走
+    # update_account / _mark 即时落 —— 那些决定账号能不能被 select，等不得。
+    # 延迟为 0 时不起刷写线程（测试专用：落库时机完全由 flush_dirty 显式控制）。
+    _FLUSH_DELAY_SECONDS = 5.0
+
+    def touch_account(self, account: Account) -> None:
+        """热路径计数变更登记：内存对象已被调用方改过，这里只安排落库。"""
+        with self._lock:
+            if self._find_locked(account.provider, account.id) is None:
+                return
+            self._dirty.add(account.id)
+            self._schedule_flush_locked()
+
+    def _schedule_flush_locked(self) -> None:
+        """安排一次延后刷写（须持锁调用）。延迟为 0 = 手动模式，不起线程。"""
+        if self._FLUSH_DELAY_SECONDS > 0 and self._flush_timer is None:
+            timer = threading.Timer(self._FLUSH_DELAY_SECONDS, self._flush_tick)
+            timer.daemon = True
+            self._flush_timer = timer
+            timer.start()
+
+    def _flush_tick(self) -> None:
+        with self._lock:
+            self._flush_timer = None
+        self.flush_dirty()
+
+    def flush_dirty(self) -> None:
+        """把脏账号落库。单条失败把 id 放回待刷并重排定时器，下次再试。
+
+        逐条**持锁**复检再写：targets 收集与写回之间账号可能被 remove_account
+        删掉，INSERT OR REPLACE 不复检就会把已删行救活，而 flush 自己的 commit
+        会让 _watch.data_version 变化、下次 sync_from_disk 把复活行重新载入
+        （review P1）。flush 在 timer 线程，持锁只让 loop 上的 touch_account
+        偶发等一条 persist（ms 级），仍远好于旧的每请求同步落库。
+        """
+        with self._lock:
+            dirty = self._dirty
+            self._dirty = set()
+            targets = [a for accounts in self._accounts.values() for a in accounts
+                       if a.id in dirty]
+        missed: set[str] = set()
+        for account in targets:
+            with self._lock:
+                if self._find_locked(account.provider, account.id) is None:
+                    continue
+                try:
+                    self._persist_account(account)
+                except Exception:  # noqa: BLE001 - 单条失败不拖垮整批（timer 线程内不可抛）
+                    missed.add(account.id)
+        if missed:
+            with self._lock:
+                self._dirty |= missed
+                self._schedule_flush_locked()
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
     def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:

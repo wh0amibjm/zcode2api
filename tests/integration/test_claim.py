@@ -25,12 +25,26 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
             self.solve_count = 0
             self.invalidated = 0
 
+        class _Token:
+            param = "stub-verify-param"
+            region = "sgp"
+
+        async def acquire_token(self, port=None):
+            self.solve_count += 1
+            return self._Token()
+
         async def get_verify_param(self, port=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
         async def fetch_config(self):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp", "sceneId": "mock-scene"}
+
+        def on_challenge(self, token=None):
+            self.invalidated += 1
+
+        def note_accept(self):
+            pass
 
         def invalidate(self):
             self.invalidated += 1
@@ -117,9 +131,10 @@ class TestClaim:
         outcome = res.json()["outcomes"][0]
         assert outcome["ok"] is False
         assert "验证码校验失败" in outcome["message"]
-        # 3007 → 换码重试一次：求解 2 次 + invalidate 1 次
+        # 3007 → 换码重试一次：求解 2 次；两次 3007 都上报挑战（attempt 2 的
+        # token 信号也要进池 streak，见 claim.claim 的 on_challenge 无条件调用）
         assert stub.solve_count == 2
-        assert stub.invalidated == 1
+        assert stub.invalidated == 2
         assert res.json()["summary"] == {"ok": 0, "fail": 1}
 
     async def test_preview_reports_activation_events(self, claim_env):
@@ -215,10 +230,10 @@ class TestClaim:
 
         client, _mock, stub, acc = claim_env
 
-        async def _exhausted(port=None):
+        async def _exhausted(self, port=None):
             raise CaptchaSolveError("验证码求解失败: 多次重试无结果")
 
-        monkeypatch.setattr(type(stub), "get_verify_param", _exhausted)
+        monkeypatch.setattr(type(stub), "acquire_token", _exhausted)
         res = await client.post("/admin/api/claim",
                                 json={"account_ids": [acc.id], "plan_id": "mock-claim-plan"},
                                 headers={"Authorization": "Bearer zcode"})

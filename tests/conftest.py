@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import tempfile
 import threading
 import time
 
@@ -19,6 +20,12 @@ import pytest
 import pytest_asyncio
 import uvicorn
 from httpx import ASGITransport, AsyncClient
+
+# 测试绝不触碰真实号池库：任何 app.store 的导入（含收集期的模块级单例 Store()）
+# 都必须落在会话级临时目录。必须放在 app.settings 首次导入**之前** —— settings 在
+# import 期从环境派生 DATA_DIR/DB_PATH；load_dotenv 不覆盖已存在的环境变量，所以
+# 这里显式强制而非 setdefault，防外部环境把测试指回真实库。
+os.environ["ZCODE_DATA_DIR"] = tempfile.mkdtemp(prefix="zcode2api-tests-data-")
 
 from app import settings
 from tests.mock_upstream import server as mock_server_module
@@ -75,6 +82,15 @@ def fresh_app(tmp_path, monkeypatch):
     from app import store as store_module
     from app.store import Store
 
+    # 热路径落库的刷写线程在测试里必须关闭：后台 5s 定时器会在**后续**用例运行
+    # 期间写旧 tmp 库，是套件顺序 flake 的放大器。置 0 = touch_account 只标脏，
+    # 落库时机完全由用例显式 flush_dirty() 控制（见 store.touch_account 注释）。
+    monkeypatch.setattr(Store, "_FLUSH_DELAY_SECONDS", 0)
+    # auto-claim 的入池首睡同理冻结：oauth 用例的 teardown drain 窗口里它若醒来，
+    # 会与 exchange followup 形成毫秒级竞态（浸泡 agent 实证）。真要测领取时序的
+    # 用例自行 monkeypatch 更小的值。
+    monkeypatch.setattr(settings, "CLAIM_SETTLE_SECONDS", 3600)
+
     fresh = Store()
     for mod_name in _STORE_BINDING_MODULES:
         mod = importlib.import_module(mod_name)
@@ -87,14 +103,33 @@ def fresh_app(tmp_path, monkeypatch):
     return fresh
 
 
+class _StubToken:
+    """验证码 token 桩对象：gateway 持有它以便被挑战时精确指认。"""
+
+    param = "mock-verify-param"
+    region = None
+
+
 class _StubCaptcha:
     """验证码桩：永不打真网。"""
 
     def __init__(self) -> None:
         self.invalidated = 0
+        self.accepts = 0
+        self.acquires = 0
+
+    async def acquire_token(self, port: int | None = None) -> _StubToken:
+        self.acquires += 1
+        return _StubToken()
 
     async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
         return "mock-verify-param", None
+
+    def on_challenge(self, token=None) -> None:
+        self.invalidated += 1
+
+    def note_accept(self) -> None:
+        self.accepts += 1
 
     def invalidate(self) -> None:
         self.invalidated += 1
@@ -124,8 +159,20 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     monkeypatch.setattr(settings, "OAUTH_API_BASE", f"{base}/api/v1")
     monkeypatch.setattr(settings, "ZAI_EXCHANGE_ORIGIN", base)
 
+    # install 序里 _fetch_client_configs 打的是 constants.CLIENT_CONFIGS_URL
+    # （不走 settings.UPSTREAM），不指 mock 就是一次真实上游出口。
+    from app import constants as app_constants
+    monkeypatch.setattr(app_constants, "CLIENT_CONFIGS_URL", f"{base}/api/v1/client/configs")
+
     from app.routes import gateway as gateway_module
+    from app import captcha as captcha_module
+    from app import claim as claim_module
     monkeypatch.setattr(gateway_module, "captcha_manager", stub_captcha)
+    # claim 的绑定点也要桩：oauth ready 用例的 auto-claim 后台任务可能在 teardown
+    # 窗口醒来，不桩就会走真实 captcha_manager → 真实配置 URL → Node 子进程真解
+    # 验证码（子代理浸泡实证过这条真网链路，见 vendor/README.md 2026-09-27 节）。
+    monkeypatch.setattr(claim_module, "captcha_manager", stub_captcha)
+    monkeypatch.setattr(captcha_module, "captcha_manager", stub_captcha)
 
     from app.main import create_app
     gateway = create_app()

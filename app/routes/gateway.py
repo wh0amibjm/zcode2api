@@ -23,6 +23,7 @@ from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota
 from ..store import store
+from ..upstream_http import SSL_CTX
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
@@ -58,14 +59,14 @@ def _client() -> httpx.AsyncClient:
     """
     global _upstream_client, _upstream_client_loop
     if not _HTTP_REUSE:
-        return httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+        return httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS, verify=SSL_CTX)
     try:
         loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
     if (_upstream_client is None or _upstream_client.is_closed
             or _upstream_client_loop is not loop):
-        _upstream_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+        _upstream_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS, verify=SSL_CTX)
         _upstream_client_loop = loop
     return _upstream_client
 
@@ -921,6 +922,29 @@ async def _sse_events(up: "_Upstream"):
             yield evt
 
 
+def _client_captcha(incoming_headers: dict | None) -> tuple[str, str | None] | None:
+    """官方客户端形态：请求自带已解的验证码 param 时返回 (param, region)。
+
+    官方 ZCode 客户端打 zcode.z.ai origin 时自行求解并随请求带上 verify_param；
+    此前 build_request 会把它覆盖成池内 token —— 等于把客户端的求解成果扔掉，
+    再白烧一枚池货。这里读出来交给 _try_account 透传。注意：两个 captcha 头已
+    加入 _DROP_HEADERS（防大小写双键发重复同名头），上游发出的值统一由
+    verify_param/verify_region 赋值决定，不经 merge 循环。
+    """
+    if not incoming_headers:
+        return None
+    param = region = None
+    for key, value in incoming_headers.items():
+        lower = str(key).lower()
+        if lower == constants.CAPTCHA_HEADER.lower():
+            param = (value or "").strip() or None
+        elif lower == constants.CAPTCHA_REGION_HEADER.lower():
+            region = (value or "").strip() or None
+    if param is None:
+        return None
+    return param, region
+
+
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
                        slot_box: list | None = None):
     """尝试用单个账号转发，含验证码续期与可配置重试。
@@ -937,6 +961,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
       - 风控（3012/405「unusual activity」真封禁）：直接禁用账号（UI 展示），
         人工确认恢复后手动启用，不做自动退避
     """
+    client_captcha = _client_captcha(incoming_headers)
     captcha_retries = 0
     retries_429 = 0
     retries_5xx = 0
@@ -946,20 +971,26 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
         verify_param = verify_region = None
+        token_obj = None   # 本轮持有的池内 token；被挑战时 on_challenge 精确丢它
         if needs_captcha:
-            _park_slot(slot_box)
-            try:
-                verify_param, verify_region = await captcha_manager.get_verify_param(port)
-            except Exception as err:  # noqa: BLE001
-                logs.req_err(req_id, f"人机校验失败: {err}")
-                reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
-                return JSONResponse(
-                    {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
-                    status_code=500,
-                )
-            if not _reacquire_slot(account, slot_box):
-                logs.warn(req_id, f"账号 {account.name} 验证码等待后并发已满，切换下一个")
-                return _NEXT_ACCOUNT
+            if client_captcha is not None:
+                # 官方客户端形态：请求自带已解 verify_param —— 透传，不取池、不占名额
+                verify_param, verify_region = client_captcha
+            else:
+                _park_slot(slot_box)
+                try:
+                    token_obj = await captcha_manager.acquire_token(port)
+                except Exception as err:  # noqa: BLE001
+                    logs.req_err(req_id, f"人机校验失败: {err}")
+                    reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
+                    return JSONResponse(
+                        {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
+                        status_code=500,
+                    )
+                verify_param, verify_region = token_obj.param, token_obj.region
+                if not _reacquire_slot(account, slot_box):
+                    logs.warn(req_id, f"账号 {account.name} 验证码等待后并发已满，切换下一个")
+                    return _NEXT_ACCOUNT
 
         try:
             url, headers, payload = build_request(account, body, verify_param,
@@ -1008,10 +1039,19 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             await cm.__aexit__(None, None, None)
             await _release_client(client)
 
-            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
+            # 验证码挑战：池内 token 被拒 → 单枚失效（连续挑战才升级全清，见
+            # captcha.on_challenge）；客户端自带 token 被拒 → 不动池（不归池管），
+            # 但 verifyParam 一次性（probe_3007_isolation.py 实验 C），对后续重试
+            # 与后续账号都已无用 —— 直接从请求级头里摘掉（incoming_headers 由端点
+            # 每请求新建，可安全变更），下一轮自然降级取池，也不会被换号重放。
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
             if challenge:
-                captcha_manager.invalidate()
+                if token_obj is not None:
+                    captcha_manager.on_challenge(token_obj)
+                else:
+                    incoming_headers.pop(constants.CAPTCHA_HEADER.lower(), None)
+                    incoming_headers.pop(constants.CAPTCHA_REGION_HEADER.lower(), None)
+                    client_captcha = None
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")
@@ -1158,6 +1198,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             )
 
         # 成功：记录用量并把打开的上游流交给调用方
+        if needs_captcha:
+            captcha_manager.note_accept()
         account.use_count += 1
         account.last_used_at = time.time()
         account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
@@ -1169,7 +1211,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             account.exhausted_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):
                 account.status = Status.ACTIVE
-        store.update_account(account)
+        # 热路径只登记脏标记，5s 内合并落库（store.touch_account）：每请求一次
+        # 同步落库会在事件循环上串行占全局锁，是并发下的下一个瓶颈。状态类
+        # 变更（冷却/封禁/额度）仍走 update_account 即时落，见 _mark 各分支。
+        store.touch_account(account)
         _spawn_bg(_safe_refresh(account))
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,

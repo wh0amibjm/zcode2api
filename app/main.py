@@ -147,8 +147,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        from .store import store
         await monitor.stop()
         await claim_monitor.stop()
+        store.flush_dirty()             # 热路径脏计数退出前收口（最多丢 5s，能收则收）
         await captcha_manager.close()
         await gateway.aclose_client()   # 共享上游客户端（连接池）在进程退出时收口
 

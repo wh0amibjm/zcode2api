@@ -35,6 +35,7 @@ _JWT_B = "hB.eyJzdWIiOiJiIn0.sig"
 _JWT_C = "hC.eyJzdWIiOiJjIn0.sig"
 _JWT_D = "hD.eyJzdWIiOiJkIn0.sig"
 _JWT_E = "hE.eyJzdWIiOiJlIn0.sig"
+_JWT_F = "hF.eyJzdWIiOiJmIn0.sig"
 
 
 def _bind(secret: str) -> str:
@@ -48,7 +49,9 @@ class TestBusinessErrorIn200:
         client, _mock = gateway_client
         from tests.conftest import seed_account
 
-        seed_account(fresh_app, _JWT_A, name="a-ok")
+        # 用未被任何 sequences 喂过的 _JWT_F：本用例若复用 _JWT_A，就依赖"文件内
+        # 先于写序列的用例执行"这一顺序 —— 随机序 / -k 子集下会吃到粘滞的错误序列。
+        seed_account(fresh_app, _JWT_F, name="a-ok")
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200

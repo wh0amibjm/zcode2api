@@ -6,10 +6,11 @@
 架构对齐 zapi captcha.ts 的预解池设计：
 - 热路径永不等待：请求到来时直接从池里取一枚已解好的 token（亚毫秒），
   后台任务持续补充库存（目标 min，上限 max）。
-- token 时效：verifyParam 实际 TTL ~2 分钟，池内按 FIFO + 年龄淘汰，
-  超过 token_ttl 的直接丢弃重解。
-- 挑战失效：上游返回挑战时 invalidate() 清空整池（该批指纹可能已被
-  风控盯上，继续复用只会连环 3007）。
+- token 时效：verifyParam 实际 TTL ~2 分钟、且一次性（同一枚用过再带即 3007，
+  见 experiments/probe_3007_isolation.py 实验 C），池内按 FIFO + 年龄淘汰。
+- 挑战失效：上游回 3007 时只丢引发挑战的那一枚（on_challenge），池里其余
+  token 不受牵连 —— 同一实验证明坏 token 被拒后新 token 照常可用；只有
+  连续挑战之间没有任何成功，才认定系统性问题回退全清（旧 invalidate 语义）。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import httpx
 
 from . import constants, logs, settings
 from .store import store
+from .upstream_http import SSL_CTX
 
 # 池参数（对齐 zapi：min 20-40 / max 120 过重，单账号网关用小池足矣）
 POOL_MIN = settings.CAPTCHA_POOL_MIN
@@ -69,6 +71,8 @@ class CaptchaManager:
         self._solve_seconds = 0.0
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
+        # 连续挑战计数：两次挑战之间没有任何 note_accept() 就累加，达到升级阈值回退全清
+        self._challenge_streak = 0
 
     def stats(self) -> dict:
         """池与求解的近况（诊断热路径为什么慢时先看这个）。"""
@@ -95,7 +99,7 @@ class CaptchaManager:
             if self._config_cache and time.time() * 1000 - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
                 return self._config_cache
             try:
-                async with httpx.AsyncClient(timeout=15) as client:
+                async with httpx.AsyncClient(timeout=15, verify=SSL_CTX) as client:
                     res = await client.get(
                         f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
                     )
@@ -240,16 +244,17 @@ class CaptchaManager:
         self._bg_tasks.add(task)             # 事件循环只持弱引用，裸 task 会被 GC
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+    async def acquire_token(self, port: int | None = None) -> _Token:
         """取一枚可用 token：优先池内现成的（跳过过期），池空才等一轮共享补货。
 
-        返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
+        返回 token 对象而非裸 param：调用方被上游挑战时要能精确指认"是哪一枚
+        被拒"，on_challenge 才能只丢它。region 可能为 None（旧求解器无 region 概念）。
         """
         # 1) 池内直取（热路径，亚毫秒）
         token = self._take()
         if token is not None:
             self._kick_refill()              # 取走一枚就补回一枚
-            return token.param, token.region
+            return token
 
         # 2) 池空：等一轮共享补货。并发请求在这里排队等**同一批**求解，
         #    而不是各自起一个 Node 进程 —— 这是并发不雪崩的关键。
@@ -257,12 +262,54 @@ class CaptchaManager:
         token = self._take()
         if token is not None:
             self._kick_refill()
-            return token.param, token.region
+            return token
 
         # 3) 补货也没补到（求解器故障 / 上游风控）：池与求解的近况一起进日志 ——
         #    这是诊断"池为什么空/为什么慢"唯一的现场，别只留一句"失败"。
         logs.warn("captcha", f"池空且补货未果 {self.stats()}")
         raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
+
+    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+        """acquire_token 的旧签名封装（claim 等只需裸 param 的调用方）。"""
+        token = await self.acquire_token(port)
+        return token.param, token.region
+
+    # ── 挑战处置（2026-09-27 重写，实验依据 experiments/probe_3007_isolation.py）──
+    # 实验 A/B：垃圾 param 被 3007 后，紧接着用现解的新 token 请求 200 通过 ——
+    # 挑战只打提出它的那一枚 token，不牵连池里其他 token。原先"任何一次 3007
+    # 清空整池"因此是纯浪费：一池好 token 全扔，所有并发请求堵在补货批次锁上
+    # 串行放行（线上 p99 首 token 52.7s 的主要来源）。
+    # 保留的保守面：连续 _CHALLENGE_ESCALATION 次挑战之间没有任何成功，说明问题
+    # 是系统性的（scene 配置错 / 指纹被整批拉黑），此时回退旧行为全清整池。
+    _CHALLENGE_ESCALATION = 2
+
+    def on_challenge(self, token: _Token | None = None) -> None:
+        """上游对某枚 token 回 3007 后的池处置：默认只丢它。"""
+        self._challenge_streak += 1
+        if self._challenge_streak >= self._CHALLENGE_ESCALATION:
+            self.invalidate()
+            self._challenge_streak = 0
+            return
+        if token is not None:
+            self._evict_token(token)
+
+    def note_accept(self) -> None:
+        """一枚 token 被上游正常消费（未挑战）后调用，重置连续挑战计数。"""
+        self._challenge_streak = 0
+
+    def _evict_token(self, token: _Token) -> None:
+        """只把指定那一枚从池里去掉（按对象身份），其余 token 原序保留。"""
+        kept: list[_Token] = []
+        while True:
+            try:
+                candidate = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._pool_size = max(0, self._pool_size - 1)
+            if candidate is not token and not candidate.expired():
+                kept.append(candidate)
+        for candidate in kept:
+            self._put(candidate)
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def _solve_one(self, config: dict) -> _Token | None:

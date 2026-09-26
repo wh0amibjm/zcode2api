@@ -21,6 +21,7 @@ import httpx
 from . import constants, logs, settings
 from .captcha import captcha_manager
 from .models import Account, Status
+from .upstream_http import SSL_CTX
 
 
 class ClaimError(Exception):
@@ -113,7 +114,7 @@ def parse_plan(raw: dict) -> dict | None:
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
+        async with httpx.AsyncClient(timeout=25, verify=SSL_CTX) as client:
             res = await client.request(
                 method, f"{settings.ZCODE_BILLING_BASE}{path}",
                 headers=headers, **kwargs,
@@ -346,9 +347,9 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
     last_err: ClaimError | None = None
     for attempt in (1, 2):
-        verify_param, verify_region = await captcha_manager.get_verify_param()
+        token = await captcha_manager.acquire_token()
         config = await captcha_manager.fetch_config()
-        headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
+        headers = _claim_headers(account, token.param, token.region or config.get("region"))
 
         body = await _billing_request(
             account, "POST", "/billing/claim",
@@ -356,12 +357,16 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
         )
         code = _business_code(body)
         if code == 0:
+            captcha_manager.note_accept()
             return {"plan_id": plan_id, "plan_name": plan_name, "grants": grants}
-        if code == 3007 and attempt == 1:
-            logs.warn("claim", f"账号 {account.name} 验证码被拒，换码重试")
-            captcha_manager.invalidate()
-            last_err = ClaimError(_fail_message(code, body))
-            continue
+        if code == 3007:
+            # 无条件上报挑战：token 信号要进池的 streak 统计，attempt==2 才终止
+            captcha_manager.on_challenge(token)
+            if attempt == 1:
+                logs.warn("claim", f"账号 {account.name} 验证码被拒，换码重试")
+                last_err = ClaimError(_fail_message(code, body))
+                continue
+            raise ClaimError(_fail_message(code, body))
         raise ClaimError(_fail_message(code, body))
     raise last_err or ClaimError("领取失败")
 

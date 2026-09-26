@@ -16,11 +16,26 @@ def _oauth_header_names(headers: dict) -> set[str]:
 
 
 async def _drain_login_followup() -> None:
+    """有界收尾 oauth 后台任务，防止跨用例唤醒。
+
+    两类消费者都要伺候：兑换链用例断言 followup **真跑完**（copy 端点 +1），
+    必须等；delay=30 的时序用例断言不依赖 followup，等满 30s 是纯浪费。
+    所以先等 5s（覆盖所有 delay=0 的真实完成路径），超时才 cancel —— 快路径
+    语义不变，慢路径不再拖垮 teardown。
+    """
     from app.routes import admin_api
 
-    pending = list(admin_api._login_followup_tasks)
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    pending: list = []
+    for pool in (admin_api._login_followup_tasks, admin_api._auto_claim_tasks,
+                 admin_api._install_tasks):
+        pending.extend(t for t in pool if not t.done())
+    if not pending:
+        return
+    _done, still = await asyncio.wait(pending, timeout=5)
+    for task in still:
+        task.cancel()
+    if still:
+        await asyncio.gather(*still, return_exceptions=True)
 
 
 @pytest.mark.integration
@@ -107,18 +122,22 @@ class TestOAuthLoginFlow:
         assert poll2["status"] == "pending"
 
     async def test_ready_returns_before_api_key_exchange(self, gateway_client):
-        """JWT 入池必须在兑换链完成前返回 ready，避免前端下一轮 poll 误判 expired。"""
+        """JWT 入池必须在兑换链完成前返回 ready，避免前端下一轮 poll 误判 expired。
+
+        兑换延迟故意放大到 30s（远超任何负载抖动）：阈值 <10s 对负载宽容，
+        对「poll 误等整条兑换链」的回归必然超时 —— 时序断言两头都留足余量。
+        """
         client, mock = gateway_client
         fid = (await client.post("/admin/api/login/start", json={"label": "acct-fast"},
                                  headers={"Authorization": "Bearer zcode"})).json()["flow_id"]
         mock.state.oauth_state = "ready"
-        mock.state.oauth_exchange_delay = 0.6
+        mock.state.oauth_exchange_delay = 30.0
         t0 = asyncio.get_event_loop().time()
         poll = (await client.get(f"/admin/api/login/poll/{fid}",
                                  headers={"Authorization": "Bearer zcode"})).json()
         elapsed = asyncio.get_event_loop().time() - t0
         assert poll["status"] == "ready"
-        assert elapsed < 0.4
+        assert elapsed < 10.0
         accounts = (await client.get("/admin/api/accounts",
                                      headers={"Authorization": "Bearer zcode"})).json()
         assert accounts["stats"]["total"] == 1

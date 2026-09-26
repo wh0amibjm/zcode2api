@@ -29,6 +29,7 @@ import time
 import httpx
 
 from . import constants, logs, telemetry
+from .upstream_http import SSL_CTX
 
 _CLIENT_TIMEOUT = 15
 
@@ -36,7 +37,7 @@ _CLIENT_TIMEOUT = 15
 async def _fetch_client_configs() -> dict:
     """第 1 步：client/configs（免鉴权）。HTTP / 业务码任一失败抛异常。"""
     url = f"{constants.CLIENT_CONFIGS_URL}?app_version={constants.BILLING_APP_VERSION}"
-    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT, verify=SSL_CTX) as client:
         res = await client.get(url, headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}"})
     res.raise_for_status()
     body = res.json()  # 非 JSON 由调用方按 ValueError 容错

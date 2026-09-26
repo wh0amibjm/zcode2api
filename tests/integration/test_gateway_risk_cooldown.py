@@ -262,7 +262,10 @@ class Test429Retry:
         monkeypatch.setattr(settings, "RETRY_429_WAIT", 0)
         monkeypatch.setattr(gw, "_parse_retry_after", lambda _: None)
         seed_account(fresh_app, _RISK_JWT, name="a-429")
+        # mock 的序列 idx = min(counter, len-1) 且 counter 会话级累加：不重置的话
+        # 前面用例烧掉的计数会让本用例首调直接命中末位 "ok"，重试路径静默空转。
         mock.state.sequences[_RISK_JWT[:16]] = ["rate_limited", "ok"]
+        mock.state.counters[_RISK_JWT[:16]] = 0
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200  # 第 1 次重试即成功
@@ -378,6 +381,7 @@ class Test5xxRetry:
         monkeypatch.setattr(settings, "RETRY_5XX_WAIT", 0)
         seed_account(fresh_app, _RISK_JWT, name="a-5xx")
         mock.state.sequences[_RISK_JWT[:16]] = ["server_error", "ok"]
+        mock.state.counters[_RISK_JWT[:16]] = 0   # 同 429 用例：先清计数才走得到重试
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200

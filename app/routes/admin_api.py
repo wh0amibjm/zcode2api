@@ -626,6 +626,13 @@ async def monitoring():
     return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
 
 
+@router.get("/captcha/stats")
+async def captcha_stats():
+    """验证码池与求解近况（诊断"池为什么空 / TTFT 为什么抖"先看这个）。"""
+    from ..captcha import captcha_manager
+    return {"stats": captcha_manager.stats()}
+
+
 @router.post("/monitoring/clear")
 async def monitoring_clear():
     reqlog.clear()

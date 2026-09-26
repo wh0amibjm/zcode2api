@@ -27,6 +27,7 @@ from pathlib import Path
 import httpx
 
 from . import constants, logs, settings
+from .upstream_http import SSL_CTX
 
 HOME_ORIGIN = "https://zcode.z.ai"
 HOME_PATHS = ("/cn", "/")          # 中文站优先；两站内容一致，互为兜底
@@ -129,6 +130,7 @@ async def refresh(force: bool = False) -> str | None:
         timeout=httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0),
         follow_redirects=True,
         headers={"User-Agent": constants.USER_AGENT},
+        verify=SSL_CTX,
     ) as client:
         version, why = await detect(client)
 

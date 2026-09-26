@@ -17,6 +17,7 @@ import uuid
 import httpx
 
 from . import constants, settings
+from .upstream_http import SSL_CTX
 
 _TIMEOUT = 10
 
@@ -60,7 +61,7 @@ async def post_activation_event(profile, user_id: str, element: str,
     HTTP >= 400 或业务码非 0 抛 RuntimeError，文案含定位信息（"HTTP 500" /
     "业务码异常"）；httpx.HTTPError 原样上抛 —— 容错策略（中止/继续）由调用方定。
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=SSL_CTX) as client:
         res = await client.post(settings.ZCODE_EVENT_REPORT_URL,
                                 headers={"Content-Type": "application/json"},
                                 json=build_activation_event_body(element, profile, user_id))

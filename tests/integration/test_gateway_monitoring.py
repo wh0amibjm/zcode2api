@@ -9,7 +9,9 @@ import pytest
 _GOOD_JWT = "hM.eyJzdWIiOiJtIn0.sig"
 _STREAM_JWT = "hS.eyJzdWIiOiJzIn0.sig"      # 流式测试独立 JWT（mock 场景序列按凭证前缀绑定）
 _OAI_STREAM_JWT = "hT.eyJzdWIiOiJ0In0.sig"
-_BG_JWT = "hB.eyJzdWIiOiJiIn0.sig"          # 后台任务测试独立 JWT（mock 序列按凭证共享，防串场）
+_BG_JWT = "hW.eyJzdWIiOiJ3In0.sig"          # 后台任务测试独立 JWT（前缀必须全库唯一：
+                                            # mock bind 取凭据前 16 字符，此前与 business_error 的
+                                            # _JWT_B 撞前缀，靠"恰好不打上游"才没炸）
 
 ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
 
