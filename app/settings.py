@@ -59,6 +59,22 @@ CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
+# ── 活动自动领取 ─────────────────────────────────────────────────────────────
+# 活动是分批投放的（同一账号的 preview 会先后出现不同场次），入池时领一次会漏。
+# 周期检查并自动领取；billing/* 是上游 WAF 风险点，故节拍拉长 + 账号间错峰。
+#
+# 默认 6 小时（2026-09-26 上调，原 1800s）：那天 30 分钟一轮的 billing 与注册链路共用
+# 同一批出口 IP，高频查询把出口打到被上游丢包封锁（z.ai 全域名超时、其它站点正常）。
+# 活动以「天」计，6 小时一轮足够吃到新场次，又把流量压到 1/12。
+CLAIM_INTERVAL = _int("ZCODE_CLAIM_INTERVAL", 6 * 3600)  # 0 = 关闭周期领取
+CLAIM_STAGGER = _int("ZCODE_CLAIM_STAGGER", 5)           # 账号之间的间隔秒数
+CLAIM_START_DELAY = _int("ZCODE_CLAIM_START_DELAY", 60)  # 启动后首次检查的延迟
+
+# ── 额度耗尽试探窗 ───────────────────────────────────────────────────────────
+# 上游 free Start Plan 是日窗口，额度耗尽时 billing 会回落成空数组（失去「数字
+# 恢复」这条路径）。EXHAUSTED 账号到期后放回池子试一次，成功即自动复活。
+EXHAUST_RETRY_SECONDS = _int("ZCODE_EXHAUST_RETRY_SECONDS", 1800)
+
 # 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
@@ -102,7 +118,13 @@ ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REP
 OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/api/v1")
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
-USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
+# 上游 UA：显式 env 覆盖优先；否则跟随 constants 的动态版本
+# （写成常量会在 import 时被求值一次，探测到新版本也刷不进去）
+USER_AGENT_OVERRIDE = os.getenv("UPSTREAM_USER_AGENT", "")
+
+
+def user_agent() -> str:
+    return USER_AGENT_OVERRIDE or constants.USER_AGENT
 APP_VERSION = "2.5.11"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"

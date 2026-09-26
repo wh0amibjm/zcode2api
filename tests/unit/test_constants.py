@@ -24,22 +24,22 @@ def test_billing_base():
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.11.2"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.14.1"
 
 
 def test_client_version_single_source():
-    # asar 客户端 3.11.2
-    # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.11.2"
+    # 3.14.1：实测这是 start-plan 额度的闸门版本（3.11.2 时上游不下发 plan，
+    # messages 回 200+code 1005）。全部版本出口必须引用同一常量。
+    assert constants.CLIENT_APP_VERSION == "3.14.1"
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
 def test_billing_version_and_activation():
-    # zcode-switch v1.5.4 实证（2026-09-06 移植）：billing 族用官方现行版 3.11.2，
-    # 与 messages 指纹 CLIENT_APP_VERSION（已真机验证）刻意分离
-    assert constants.BILLING_APP_VERSION == "3.11.2"
+    # billing 族与 messages 指纹同版本：实测 3.14.1 下 billing/current 才会返回
+    # 非空 plans（3.11.2 时是空数组 —— 与 messages 的 1005 同源）
+    assert constants.BILLING_APP_VERSION == "3.14.1"
     assert constants.BILLING_TITLE == "Z Code@electron"
     assert constants.BILLING_RELEASE_CHANNEL == "stable"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"

@@ -51,6 +51,11 @@ class Account:
     last_used_at: float | None = None
     last_checked_at: float | None = None
     cooling_until: float | None = None
+    # 额度用完后的试探窗口：EXHAUSTED 到期即允许重新入池试一次。
+    # 上游额度是日窗口，而额度耗尽时 billing 会回落成空数组（线上 2026-09-26 实测
+    # plans/balances 均为 []），没有时间窗就只能等人工放行 —— 额度明明回来了、
+    # 账号却永远不被选中。有窗口时由「成功即复活」闭环收口，额度仍空则再顺延一轮。
+    exhausted_until: float | None = None
     last_error: str | None = None
     created_at: float = field(default_factory=time.time)
     # 每账号客户端指纹（fingerprint.DeviceProfile；dataclass 存 dict，取用时还原）
@@ -129,7 +134,12 @@ class Account:
         if not self.enabled:
             return False
         if self.status == Status.EXHAUSTED:
-            return False
+            # 带窗口的按窗口放行（到期试探一次）；历史数据无窗口时保持旧语义：
+            # 不可选，只由额度刷新（quota.fetch_quota 的日窗口判定）复活。
+            if not self.exhausted_until:
+                return False
+            now = now or time.time()
+            return now >= self.exhausted_until
         if self.status in (Status.INVALID, Status.DISABLED):
             return self.has_apikey_fallback()
         if self.status == Status.COOLING:
@@ -199,8 +209,12 @@ class Account:
 
     def effective_status(self, now: float | None = None) -> str:
         """考虑冷却到期后的实时状态。"""
+        now = now or time.time()
         if self.status == Status.COOLING:
-            now = now or time.time()
             if self.cooling_until and now >= self.cooling_until:
+                return Status.ACTIVE
+        elif self.status == Status.EXHAUSTED:
+            # 试探窗口到期 → UI 与轮询同步显示为可再次尝试
+            if self.exhausted_until and now >= self.exhausted_until:
                 return Status.ACTIVE
         return self.status

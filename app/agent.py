@@ -108,7 +108,7 @@ def build_request(
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
-            "User-Agent": settings.USER_AGENT,
+            "User-Agent": settings.user_agent(),
             "X-ZCode-App-Version": constants.X_ZCODE_APP_VERSION,
             "X-ZCode-Agent": constants.X_ZCODE_AGENT,
             "HTTP-Referer": constants.HTTP_REFERER,

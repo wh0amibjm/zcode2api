@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 
@@ -342,3 +343,83 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
             continue
         raise ClaimError(_fail_message(code, body))
     raise last_err or ClaimError("领取失败")
+
+
+class ClaimMonitor:
+    """后台周期性检查活动投放并自动领取。
+
+    基座的自动领取只在**入池那一刻**跑（admin_api 的 add_accounts / oauth login /
+    import 三处），而活动是**分批投放**的：2026-09-26 实测同一个账号的 preview 先只有
+    `zcode-v3-start-plan-0926`（GLM-5.3-Flash 1 亿），十几分钟后才出现
+    `zcode-v3-start-plan-0924-wk-2`（周末场 3 亿）。入池时那一次因此会漏掉后续场次，
+    只能人工去后台点领取。
+
+    节拍刻意拉长、账号之间还错峰（默认 1800s / 5s，`ZCODE_CLAIM_INTERVAL` 设 0 关闭）：
+    `billing/*` 是上游 WAF 风险点，连续查询容易触发拦截
+    （docs/development/05-upstream-protocols.md §7 风险控制）。重复领取本身是幂等的 ——
+    上游回 1003「已领取过」，不会重复发放。
+    """
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    async def run_once(self) -> list[str]:
+        """跑一轮：对每个合格账号做一次「激活上报 + preview + 领取」。
+
+        写成独立方法而不是塞进循环体，是为了可测 —— 循环只负责节拍。返回本轮实际
+        尝试过的账号名，便于断言与排障。
+        """
+        from .store import store
+
+        attempted: list[str] = []
+        for acc in store.list_accounts("zai"):
+            if self._stop.is_set():
+                break
+            if acc.mode != "jwt" or not acc.allows_billing():
+                continue
+            live = store.find(acc.provider, acc.id)
+            if live is None or not live.allows_billing():
+                continue
+            try:
+                await auto_claim_all_plans(live)
+                attempted.append(live.name)
+            except Exception as err:  # noqa: BLE001 - 单账号失败不拖垮整轮
+                logs.warn("claim", f"账号 {live.name} 周期领取异常: {err}")
+            await asyncio.sleep(settings.CLAIM_STAGGER)  # 错峰，别连打 billing
+        return attempted
+
+    async def _loop(self) -> None:
+        # 先让位给启动安装序与额度首刷
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=settings.CLAIM_START_DELAY)
+            return
+        except TimeoutError:
+            pass
+
+        while not self._stop.is_set():
+            interval = settings.CLAIM_INTERVAL
+            if interval > 0:
+                try:
+                    await self.run_once()
+                except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
+                    logs.err("claim", f"后台领取轮询出错: {err}")
+            wait = interval if interval > 0 else 60
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+            except TimeoutError:
+                continue
+
+    def start(self) -> None:
+        if self._task is None:
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+
+
+claim_monitor = ClaimMonitor()

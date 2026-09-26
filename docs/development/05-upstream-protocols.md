@@ -89,6 +89,16 @@ API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证
 | 429 | 限流 | cooling 300s |
 | 401 / 403(非验证码) | 凭证失效 | invalid，直到重登 |
 | 403 + captcha 挑战 / 400+`code:3007` | 验证码问题 | 刷新 verifyParam 原账号重试 |
+| **HTTP 200** + body 业务码 —— `{"code":1005,"msg":"exceed quota limit"}`（2026-09-26 实测） | 额度耗尽，**与状态码无关，看体里的 code** | 归一化成 `402` 后走同一分支：标 `exhausted`（带 30min 试探窗）+ 换号 |
+
+**200 里带业务码这一形态必须单独处理**：只判 `status_code >= 400` 的实现会把它当成功 ——
+`recent_results` 记 `ok=True`、账号不换、客户端收到「200 但体不是 message」的响应，额度回来那天
+也没有任何东西知道。实测形态是**流式请求也回 JSON**（`content-type: application/json`，不是
+`text/event-stream`），所以按 content-type 排除 SSE 后预读一次即可覆盖两个路径；判定口径与真实
+4xx 同源（额度→402 / 风控→405 / 验证码→400 / 未知业务码→502），不存在第二套分类逻辑。
+**额度是日窗口**，耗尽时 `billing/current` 与 `billing/balance` 都会回落成空数组 —— 即「数字恢复」
+这条路径消失，故 `exhausted` 必须自带时间窗（`ZCODE_EXHAUST_RETRY_SECONDS`，默认 1800s），
+到期放回池子试一次，成功由成功分支的 `EXHAUSTED→ACTIVE` 收口。
 
 ## 4. 免费额度（Start Plan）
 

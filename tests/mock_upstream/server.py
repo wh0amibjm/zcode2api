@@ -181,7 +181,10 @@ def build_app() -> FastAPI:
                 headers={"x-mock-call-index": str(n), **extra_headers},
             )
 
-        if stream:
+        # 线上实测（2026-09-26）：start-plan 额度耗尽时**流式请求也回 JSON**
+        # （content-type: application/json，不是 text/event-stream）。这个场景必须
+        # 两条路径都能复现，否则「200 业务码」嗅探的流式覆盖面没有回归。
+        if stream and scenario != "quota_exceeded_200":
             chunks = int(headers.get("x-mock-sse-chunks", 3))
             truncate_at = headers.get("x-mock-sse-truncate-at")
             content = _sse_stream(chunks)
@@ -215,6 +218,11 @@ def build_app() -> FastAPI:
         }
         if scenario == "quota_exhausted":
             return 402, _error_body("insufficient balance"), {}
+        if scenario == "quota_exceeded_200":
+            # 线上 2026-09-26 实测形态：start-plan（JWT）通道额度耗尽**不回 4xx**，
+            # 而是 HTTP 200 + 体里带业务码 {"code":1005,"msg":"exceed quota limit"}。
+            # 按状态码判成功的写法会把它当成功，故单列一个场景钉住。
+            return 200, {"code": 1005, "msg": "exceed quota limit", "logid": "mock-1005"}, {}
         if scenario == "quota_exhausted_400":
             return 400, {"code": 1002, "message": "额度已用完"}, {}
         if scenario == "rate_limited":

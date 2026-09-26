@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import logs, settings
 from .captcha import captcha_manager
+from .claim import claim_monitor
 from .quota import monitor
 from .routes import admin_api, gateway, pages
 
@@ -82,6 +83,7 @@ def _backfill_install_ids() -> int:
 # 启动安装序的后台任务引用：事件循环对 task 只持弱引用（asyncio 官方文档），
 # 不保存引用任务可能被 GC 中途丢弃且无日志 —— 与 captcha._refill_task 同一模式
 _install_task: asyncio.Task | None = None
+_version_task: asyncio.Task | None = None
 
 
 def _run_install_sequence_on_start() -> None:
@@ -100,6 +102,27 @@ def _run_install_sequence_on_start() -> None:
     _install_task = asyncio.create_task(_run())
 
 
+def _align_upstream_version_on_start() -> None:
+    """后台对齐客户端版本号。
+
+    版本号是 start-plan 的**额度闸门**（写死则上游一升级这边就静默失去额度，症状还是
+    误导性的 "exceed quota limit"），所以每次启动后台探一次并缓存。与安装序同理：
+    纯网络动作、失败无所谓、绝不能阻塞启动 —— 故 fire-and-forget，且持有强引用
+    （事件循环对 task 只持弱引用，裸 create_task 会被 GC 静默丢弃）。
+    """
+    global _version_task
+
+    from . import upstream_version
+
+    async def _run() -> None:
+        try:
+            await upstream_version.refresh()
+        except Exception as err:  # noqa: BLE001 —— 后台任务异常无人接收，必须自兜
+            logs.err("version", f"版本探测意外异常: {err}")
+
+    _version_task = asyncio.create_task(_run())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     replaced = _backfill_fingerprints()
@@ -111,8 +134,10 @@ async def lifespan(app: FastAPI):
     if installed:
         logs.ok("install", f"存量账号补配安装身份 ×{installed}")
     monitor.start()
+    claim_monitor.start()     # 周期检查活动投放（活动分批上线，入池时那次会漏）
     captcha_manager.start()   # 验证码预解池后台补充
     _run_install_sequence_on_start()
+    _align_upstream_version_on_start()   # 版本探测（写死会被上游升级甩下）
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
@@ -123,6 +148,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await monitor.stop()
+        await claim_monitor.stop()
         await captcha_manager.close()
 
 

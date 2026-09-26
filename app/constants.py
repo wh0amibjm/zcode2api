@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import re
+
 # ── 上游 origin ──────────────────────────────────────────────────────────────
 # Plan 通道（JWT + 验证码）：zcode.z.ai 的 coding-plan 代理端点
 ZCODE_ORIGIN = "https://zcode.z.ai"
@@ -41,17 +43,64 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端版本（单一真相源：asar 客户端 3.11.2，旧版 3.10.2 已随官方升级）────
+# ── 客户端版本（单一真相源）───────────────────────────────────────────────────
+# 版本号是**额度闸门**，不只是指纹：2026-09-26 实测，报 3.11.2 时上游对 start-plan
+# 账号连 plan 都不下发（billing/current 与 billing/balance 都是空数组），messages
+# 一律回 HTTP 200 + {"code":1005,"msg":"exceed quota limit"}；改成 3.14.1 后同一账号
+# 立刻恢复：plan_id=zcode-v3-start-plan-0817、GLM-5.3 300万 / GLM-5.3-Flash 500万
+# 日窗口正常下发，调用出话。故「旧版本号」会被上游当成不合格客户端，症状是"没有额度"
+# 而不是"版本不支持"—— 排查额度问题时先看这里的版本，再看额度数字。
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-CLIENT_APP_VERSION = "3.11.2"
+# 当前生效的客户端版本。**运行时可被探测覆盖**（见 upstream_version.py）——
+# 写死的代价已经付过一次：上游一升级，这边静默失去 start-plan 额度。
+_CLIENT_APP_VERSION = "3.14.1"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
-CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
+
+
+def set_client_app_version(version: str) -> bool:
+    """写入探测到的客户端版本；返回是否真的变了（变了就要重建 UA 等派生值）。
+
+    只接受 `数字.数字[.数字]` 形态 —— 探测源是网页，宁可保持原值也不吃进垃圾。
+    """
+    global _CLIENT_APP_VERSION
+    v = (version or "").strip()
+    if not re.match(r"^\d+\.\d+(\.\d+)?$", v):
+        return False
+    if v == _CLIENT_APP_VERSION:
+        return False
+    _CLIENT_APP_VERSION = v
+    return True
+
+
+# 版本相关的派生常量走模块级 __getattr__（PEP 562）实时求值：探测到新版本后，
+# CLIENT_CONFIGS_QUERY / USER_AGENT / X_ZCODE_APP_VERSION / BILLING_APP_VERSION
+# 自动跟着变，十几处调用点一行都不用改（它们本来就写成 `constants.X` 而不是
+# from-import，见 tests/unit/test_constants.py 的存在性断言）。
+_DYNAMIC = {
+    "CLIENT_APP_VERSION",
+    "X_ZCODE_APP_VERSION",
+    "BILLING_APP_VERSION",
+    "USER_AGENT",
+    "CLIENT_CONFIGS_QUERY",
+}
+
+
+def __getattr__(name: str):
+    if name == "CLIENT_APP_VERSION":
+        return _CLIENT_APP_VERSION
+    if name in ("X_ZCODE_APP_VERSION", "BILLING_APP_VERSION"):
+        return _CLIENT_APP_VERSION
+    if name == "USER_AGENT":
+        return f"ZCode/{_CLIENT_APP_VERSION}"
+    if name == "CLIENT_CONFIGS_QUERY":
+        return f"app_version={_CLIENT_APP_VERSION}"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版 3.11.2（对齐官方客户端现行版本）
-BILLING_APP_VERSION = "3.11.2"
+# BILLING_APP_VERSION 见上：动态求值（与 CLIENT_APP_VERSION 同源）
 BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
 BILLING_RELEASE_CHANNEL = "stable"
 # 官方客户端每日活跃事件：POST /api/v1/event/report（不在 zcode-plan 下、无
@@ -87,8 +136,8 @@ MAX_TOKENS_LIMIT = 131072
 
 # ── 请求头 ───────────────────────────────────────────────────────────────────
 ANTHROPIC_VERSION = "2023-06-01"
-USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"
-X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
+# USER_AGENT 见上：动态求值
+# X_ZCODE_APP_VERSION 见上：动态求值（与 CLIENT_APP_VERSION 同源）
 X_ZCODE_AGENT = "glm"
 HTTP_REFERER = "https://zcode.z.ai/"
 CAPTCHA_HEADER = "X-Aliyun-Captcha-Verify-Param"

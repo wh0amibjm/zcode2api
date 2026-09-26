@@ -134,6 +134,47 @@ def _is_risk_control(status_code: int, text: str) -> bool:
     return any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS)
 
 
+# ── HTTP 200 里的业务错误（线上实测 2026-09-26）───────────────────────────────
+# start-plan（JWT）通道额度耗尽时不回 4xx，而是：
+#     HTTP/1.1 200 OK · content-type: application/json
+#     {"code":1005,"msg":"exceed quota limit","logid":"…"}
+# 只按 status_code 判成功的写法会把它当成功：recent_results 记 ok=True、账号不换、
+# 客户端收到「200 但内容不是 message」的响应，额度回来那天也没人知道。
+# 做法是把它归一化成等效 HTTP 状态码，复用下方既有分支（challenge/风控/额度/
+# 5xx），而不是另起一套错误处理 —— 判定口径与真实 4xx 完全同源。
+_NORMALIZED_EXHAUST = 402   # 落 EXHAUST_HTTP_STATUSES
+_NORMALIZED_RISK = 405      # 落 RISK_CONTROL_HTTP_STATUSES
+_NORMALIZED_CAPTCHA = 400   # 配合 _detect_captcha_challenge 的 body 3007 判定
+_NORMALIZED_OTHER = 502     # 未知业务码：按上游故障重试 / 冷却
+
+
+async def _sniff_business_error(resp: httpx.Response) -> tuple[int | None, bytes | None]:
+    """非 SSE 的 2xx 响应预读一次，判 body 业务码。
+
+    返回 (归一化状态码或 None, 已消费的响应体或 None)。None 状态码 = 正常响应，
+    此时必须把读到的体交回调用方（流已被读走，再迭代只会拿到空）。SSE 不读。
+    """
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "event-stream" in ctype:
+        return None, None                     # 流式成功响应的体归调用方
+    raw = await resp.aread()
+    text = raw.decode("utf-8", "ignore")
+    body = _safe_json(text)
+    if not isinstance(body, dict):
+        return None, raw                      # 非 JSON 交给下游格式校验（garbage_body 等）
+    code = body.get("code")
+    if not isinstance(code, int) or code == 0:
+        return None, raw                      # 无业务码 = 正常响应
+    low = text.lower()
+    if code == 1005 or any(k in low for k in _EXHAUST_KEYWORDS):
+        return _NORMALIZED_EXHAUST, raw
+    if any(m in low for m in constants.RISK_CONTROL_MARKERS):
+        return _NORMALIZED_RISK, raw
+    if _detect_captcha_challenge(resp, text):
+        return _NORMALIZED_CAPTCHA, raw
+    return _NORMALIZED_OTHER, raw
+
+
 def _parse_retry_after(value: str | None) -> int | None:
     """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即用默认重试等待）。
 
@@ -153,6 +194,10 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     account.last_error = error
     if status_value == Status.COOLING:
         account.cooling_until = time.time() + settings.COOLING_SECONDS
+    elif status_value == Status.EXHAUSTED:
+        # 额度是日窗口：给一个试探窗，到期自动放回池子试一次。「成功即复活」
+        # 在成功分支收口，因此额度真回来了账号无需人工干预。
+        account.exhausted_until = time.time() + settings.EXHAUST_RETRY_SECONDS
     store.update_account(account)
 
 
@@ -168,6 +213,84 @@ def _last_user_text(body: dict) -> str:
                 if isinstance(part, dict) and part.get("type") == "text":
                     return part.get("text", "")
     return ""
+
+
+def _responses_to_openai(payload: dict) -> dict:
+    """OpenAI Responses API 请求 -> OpenAI Chat Completions 请求。
+
+    只做形状转换，不碰账号池：转换完直接走 chat/completions 那条已经验证过的调度链路
+    （账号轮询、验证码、429/5xx 容灾都在 _dispatch 里），所以三条协议面共享同一份上游逻辑。
+    `instructions` 变 system，`input` 的两种形态（字符串 / item 数组）都收。
+    """
+    out: dict = {}
+    for key in ("model", "temperature", "top_p", "stream", "tools", "tool_choice",
+                "parallel_tool_calls", "metadata"):
+        if key in payload:
+            out[key] = payload[key]
+    if payload.get("max_output_tokens") is not None:
+        out["max_tokens"] = payload["max_output_tokens"]
+
+    messages: list[dict] = []
+    if payload.get("instructions"):
+        messages.append({"role": "system", "content": str(payload["instructions"])})
+
+    inp = payload.get("input")
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for item in inp:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if content is None:
+                content = item.get("text") or ""
+            if isinstance(content, list):
+                parts: list[dict] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype in ("input_text", "output_text", "text"):
+                        parts.append({"type": "text", "text": block.get("text", "")})
+                    elif btype in ("input_image", "image_url"):
+                        url = block.get("image_url") or (block.get("source") or {}).get("data")
+                        if url:
+                            parts.append({"type": "image_url", "image_url": {"url": url}})
+                content = parts
+            messages.append({"role": item.get("role") or "user", "content": content})
+    out["messages"] = messages
+    return out
+
+
+def _chat_to_responses(chat: dict, rid: str, mid: str, model: str) -> dict:
+    """OpenAI Chat Completions 响应 -> Responses 响应对象。"""
+    choice = (chat.get("choices") or [{}])[0] if isinstance(chat.get("choices"), list) else {}
+    message = choice.get("message") or {}
+    text = message.get("content") or ""
+    if isinstance(text, list):  # 上游偶尔回 content 数组
+        text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
+    usage = chat.get("usage") or {}
+    return {
+        "id": rid,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "id": mid,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+        # OpenAI 在部分 SDK 里直接读 output_text，这里一并给出，避免客户端自己拼装
+        "output_text": text,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
 
 
 @router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
@@ -274,7 +397,7 @@ async def chat_completions(request: Request):
             raise
 
     try:
-        raw = await result.resp.aread()
+        raw = await result.read_body()
         logs.req_ok(req_id)
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
@@ -293,6 +416,128 @@ async def chat_completions(request: Request):
     reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
                      input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
     return JSONResponse(anthropic_to_openai(data, model))
+
+
+def _responses_stream_response(up: _Upstream, model: str, req_id: str, rid: str, mid: str) -> StreamingResponse:
+    """上游 Anthropic SSE -> Responses API 事件序列。
+
+    复用 StreamConverter（Anthropic -> OpenAI delta）后只重新包装事件类型，所以思考链与正文的
+    分流规则在三条协议面上完全一致，不需要维护第二套解析。
+    """
+    conv = StreamConverter(model)
+    created = int(time.time())
+
+    async def _iter():
+        base = {"id": rid, "object": "response", "created_at": created, "model": model}
+        acc: list[str] = []
+        try:
+            yield "event: response.created\ndata: " + json.dumps({**base, "status": "in_progress", "output": []}) + "\n\n"
+            yield "event: response.output_item.added\ndata: " + json.dumps({**base, "output_index": 0, "item": {"id": mid, "type": "message", "status": "in_progress", "role": "assistant", "content": []}}) + "\n\n"
+            yield "event: response.content_part.added\ndata: " + json.dumps({**base, "item_id": mid, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}) + "\n\n"
+            async for line in up.resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                evt = _safe_json(line[5:].strip())
+                if not isinstance(evt, dict):
+                    continue
+                for chunk in conv.feed(evt):
+                    delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                    piece = delta.get("content")
+                    if piece:
+                        acc.append(piece)
+                        yield "event: response.output_text.delta\ndata: " + json.dumps({**base, "item_id": mid, "output_index": 0, "content_index": 0, "delta": piece}) + "\n\n"
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        yield "event: response.reasoning_summary_text.delta\ndata: " + json.dumps({**base, "item_id": mid, "output_index": 0, "summary_index": 0, "delta": reasoning}) + "\n\n"
+            text = "".join(acc)
+            usage = conv.usage or {}
+            in_tok, out_tok = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+            yield "event: response.output_text.done\ndata: " + json.dumps({**base, "item_id": mid, "output_index": 0, "content_index": 0, "text": text}) + "\n\n"
+            yield "event: response.completed\ndata: " + json.dumps({**base, "status": "completed", "output": [{"id": mid, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}], "output_text": text, "usage": {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok}}) + "\n\n"
+            logs.req_ok(req_id)
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                             input_tokens=usage.get("prompt_tokens"),
+                             output_tokens=usage.get("completion_tokens"))
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        finally:
+            await up.close()
+
+    return StreamingResponse(_iter(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_gateway_key)])
+async def responses(request: Request):
+    """OpenAI Responses API —— 与另两条协议共用同一套上游调度（见 _responses_to_openai）。"""
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
+    if not payload.get("input"):
+        return JSONResponse({"error": {"message": "input 不能为空", "type": "invalid_request_error"}}, status_code=400)
+
+    chat_payload = _responses_to_openai(payload)
+    body, err = openai_to_anthropic(chat_payload)
+    if err or body is None:
+        return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
+
+    incoming_headers = dict(request.headers)
+    provider = _detect_provider(body, request.headers)
+    body = _normalize_body(body)
+    port = request.url.port or settings.PORT
+
+    rid = "resp_" + secrets.token_hex(12)
+    mid = "msg_" + secrets.token_hex(12)
+    req_id = secrets.token_hex(8)
+    logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
+    reqlog.begin(req_id, "responses", str(body.get("model") or "-"),
+                 bool(payload.get("stream")), _last_user_text(body))
+
+    try:
+        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499)
+        raise
+    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+        return JSONResponse({"error": {"message": "网关内部错误", "type": "internal_error"}}, status_code=500)
+
+    model = str(body.get("model") or chat_payload.get("model") or "")
+    if not isinstance(result, _Upstream):
+        return result  # 调度层已给出错误响应（如 503 no_available_account），原样透出
+    if payload.get("stream"):
+        try:
+            return _responses_stream_response(result, model, req_id, rid, mid)
+        except asyncio.CancelledError:
+            await result.close()
+            raise
+
+    try:
+        raw = await result.read_body()
+        logs.req_ok(req_id)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
+        raise
+    except Exception as err:  # noqa: BLE001
+        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
+        return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
+    finally:
+        await result.close()
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict) or data.get("type") != "message":
+        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
+        return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
+    usage = data.get("usage") or {}
+    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
+                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+    return JSONResponse(_chat_to_responses(anthropic_to_openai(data, model), rid, mid, model))
 
 
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
@@ -452,11 +697,12 @@ def _limit() -> int:
 class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
-    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed")
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed",
+                 "preloaded")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 on_close=None) -> None:
+                 on_close=None, preloaded: bytes | None = None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
@@ -465,6 +711,15 @@ class _Upstream:
         self.mode = mode
         self.on_close = on_close
         self._closed = False
+        # 业务码嗅探已把非 SSE 响应读完的体（见 _sniff_business_error）：调用方
+        # 必须从这里取，不能再迭代 resp 的流。
+        self.preloaded = preloaded
+
+    async def read_body(self) -> bytes:
+        """完整响应体：已预读时直接交付缓存，否则读上游流。"""
+        if self.preloaded is not None:
+            return self.preloaded
+        return await self.resp.aread()
 
     async def close(self) -> None:
         """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。"""
@@ -485,8 +740,11 @@ class _Upstream:
 
         async def _body_iter():
             try:
-                async for chunk in up.resp.aiter_bytes():
-                    yield chunk
+                if up.preloaded is not None:
+                    yield up.preloaded      # 体已被嗅探读走，流里已无内容
+                else:
+                    async for chunk in up.resp.aiter_bytes():
+                        yield chunk
                 logs.req_ok(req_id)
                 reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
             except asyncio.CancelledError:
@@ -569,9 +827,24 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
+        preloaded: bytes | None = None
+
+        if status_code < 400:
+            # 200 里的业务错误（额度 / 风控 / 验证码 / 未知码）归一化成等效状态码，
+            # 落到下面同一套分支处理。漏掉这一步，start-plan 的 1005 会以
+            # 「HTTP 200 + ok=True」被静默吞掉：客户端收到假成功、账号不换、
+            # 额度回来了也没人知道。
+            normalized, preloaded = await _sniff_business_error(resp)
+            if normalized is not None:
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} HTTP 200 业务错误 -> 按 {normalized} 处理: "
+                    f"{preloaded.decode('utf-8', 'ignore')[:200]}",
+                )
+                status_code = normalized
 
         if status_code >= 400:
-            text = (await resp.aread()).decode("utf-8", "ignore")
+            text = (preloaded if preloaded is not None else await resp.aread()).decode("utf-8", "ignore")
             await cm.__aexit__(None, None, None)
             await client.aclose()
 
@@ -733,13 +1006,15 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             account.risk_strikes = 0
             account.last_error = None
             account.cooling_until = None
+            account.exhausted_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):
                 account.status = Status.ACTIVE
         store.update_account(account)
         _spawn_bg(_safe_refresh(account))
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
-                         account_name=account.name, mode=account.mode)
+                         account_name=account.name, mode=account.mode,
+                         preloaded=preloaded)
 
 
 def _safe_json(text: str):

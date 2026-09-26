@@ -79,7 +79,7 @@ def build_identity_headers(account=None) -> dict[str, str]:
 
     headers: dict[str, str] = {
         "HTTP-Referer": constants.HTTP_REFERER,
-        "User-Agent": settings.USER_AGENT,
+        "User-Agent": settings.user_agent(),
     }
     if app_version:
         headers["X-ZCode-App-Version"] = app_version

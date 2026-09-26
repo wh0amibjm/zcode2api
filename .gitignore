@@ -24,3 +24,6 @@ node_modules/
 # 秘钥 / 凭证导出
 *accounts*.json
 zcode-accounts*.json
+
+# 运行期日志（本仓默认没有 logs/，跑过一次就会出现）
+logs/

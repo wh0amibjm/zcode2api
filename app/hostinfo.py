@@ -7,9 +7,13 @@ host_profile / 运维对照，禁止再当作多账号共用的上游身份。
 采集项 ↔ DeviceProfile 字段：
   platform    platform.system()   → darwin / win32 / linux（官方 process.platform 语义）
   arch        platform.machine()  → arm64 / x64（官方 process.arch 语义）
-  os_version  platform.release()  → os.release() 同源，官方 X-Os-Version 直接用它
-  timezone    /etc/localtime → IANA 名：符号链接反解；实体文件则与
-              /usr/share/zoneinfo 字节比对；都失败退 UTC
+  os_version  os.release() 语义   → 官方 X-Os-Version 直接用它
+              （darwin/linux 取 platform.release()；**Windows 取 platform.version()**，
+               因为 Python 的 release() 在 Windows 上是营销版本号 "10"/"11"，
+               与 Node os.release() 的 NT 版本 "10.0.22631" 不同源 —— 见 _resolve_os_version）
+  timezone    IANA 名。顺序：$TZ → Windows 注册表 TimeZoneKeyName（映射见
+              _WIN_TZ_TO_IANA）→ /etc/localtime 符号链接反解 → 与
+              /usr/share/zoneinfo 字节比对 → 失败退 UTC
   language    $LANG（zh_CN.UTF-8 → zh-CN；缺失退 en-US）
   screen      本机无显示器（服务器形态）→ 官方桌面端必有屏幕，取 HOST_FALLBACK
   device_mid  本模块不生成 —— DeviceProfile 缺省工厂给每次采集全新 UUID；
@@ -30,19 +34,98 @@ from pathlib import Path
 # 服务器无显示器时的兜底分辨率（官方桌面端激活事件必有 screen_resolution）
 FALLBACK_SCREEN = "1920x1080"
 
+# Windows 注册表时区名 → IANA（官方 X-Client-Timezone 要 IANA 名）。
+# Windows 的 [System.TimeZoneInfo]::Local.Id 给的是 "China Standard Time" 这种
+# Windows 专名，标准库没有转换 API（.NET 6+ 的 TryConvertWindowsIdToIanaId 在
+# PowerShell 5.1 / .NET Framework 上不存在），故内置常见项映射。
+# **只列确定无疑的项；未命中一律退 UTC —— 猜错的时区比不知道更糟。**
+_WIN_TZ_TO_IANA = {
+    "UTC": "UTC",
+    "China Standard Time": "Asia/Shanghai",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Singapore Standard Time": "Asia/Singapore",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "India Standard Time": "Asia/Kolkata",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Russian Standard Time": "Europe/Moscow",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "GMT Standard Time": "Europe/London",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Romance Standard Time": "Europe/Paris",
+    "FLE Standard Time": "Europe/Kyiv",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "Egypt Standard Time": "Africa/Cairo",
+    "Eastern Standard Time": "America/New_York",
+    "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Atlantic Standard Time": "America/Halifax",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "W. Australia Standard Time": "Australia/Perth",
+    "New Zealand Standard Time": "Pacific/Auckland",
+}
+
 # $LANG 形态解析：语言主码（2-3 位小写）+ 可选地区码
 _LANG_RE = re.compile(r"^([a-z]{2,3})(?:[_-]([A-Za-z]{2,4}))?")
+
+
+def win_tz_to_iana(name: str) -> str | None:
+    """Windows 时区名 → IANA；未收录返回 None（调用方退 UTC，不猜）。"""
+    return _WIN_TZ_TO_IANA.get((name or "").strip())
+
+
+def _windows_timezone() -> str | None:
+    """Windows 本机时区（注册表 TimeZoneKeyName → IANA）。
+
+    Windows 没有 /etc/localtime，所以下面那条 Unix 通路在 Windows 上必然走到
+    「退 UTC」—— 宿主时区永远显示 UTC 是**采集缺陷**而不是事实。这里补上注册表
+    读取（`winreg` 仅在 Windows 存在，故延迟导入并容错）。
+    """
+    if platform.system().lower() != "windows":
+        return None
+    try:
+        import winreg  # noqa: PLC0415 - Windows-only，必须延迟导入
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\TimeZoneInformation",
+        ) as key:
+            name, _ = winreg.QueryValueEx(key, "TimeZoneKeyName")
+    except OSError:
+        return None
+    return win_tz_to_iana(str(name))
 
 
 def _resolve_timezone() -> str:
     """IANA 时区名：官方客户端读系统时区（Intl.resolvedOptions().timeZone）。
 
     解析顺序：
-      1. /etc/localtime 符号链接路径反解（darwin 通常如此）
-      2. /etc/localtime 为实体文件时（部分 Linux 发行版是拷贝而非链接，
+      0. $TZ —— 显式指定，跨平台都认（容器/CI 常用 `TZ=Asia/Shanghai`）
+      1. Windows：注册表 TimeZoneKeyName → 内置映射（无 /etc/localtime）
+      2. /etc/localtime 符号链接路径反解（darwin 通常如此）
+      3. /etc/localtime 为实体文件时（部分 Linux 发行版是拷贝而非链接，
          如 pxed），与 /usr/share/zoneinfo 逐文件字节比对取唯一匹配
-      3. 都失败退 UTC
+      4. 都失败退 UTC
     """
+    tz_env = (os.environ.get("TZ") or "").strip()
+    if "/" in tz_env and not tz_env.startswith("/"):
+        return tz_env
+    win = _windows_timezone()
+    if win:
+        return win
     path = Path("/etc/localtime")
     try:
         target = os.path.realpath(path)
@@ -97,6 +180,29 @@ def _resolve_language() -> str:
     return f"{lang}-{region.upper()}"
 
 
+def _resolve_os_version() -> str:
+    """X-Os-Version：对齐官方客户端的 `os.release()`（Node 语义）。
+
+    三个平台里只有 Windows 的 Python 取值与 Node **不同源**：
+
+      * darwin / linux —— `platform.release()` 就是内核版本（`23.6.0` /
+        `6.8.0-45-generic`），与 `os.release()` 一致；
+      * **Windows —— Python 的 `platform.release()` 返回营销版本号（`"10"` / `"11"`），
+        而 Node 的 `os.release()` 返回 NT 版本（`"10.0.22631"`）。** 直接采前者会得到
+        单段字符串，`fingerprint._validate(host_real=True)` 的形态门（要求 `数字.数字`）
+        随即拒绝 —— 症状就是「Windows 宿主机上 `host_profile()` 直接抛
+        ValueError: os_version 与平台不符: win32/11」。
+
+    故 Windows 改用 `platform.version()`（NT 版本，与 Node 同源）；其余平台维持
+    `platform.release()`（本就同源，不要动）。
+    """
+    if platform.system().lower() == "windows":
+        nt = (platform.version() or "").strip()
+        if re.match(r"^\d+\.\d+", nt):
+            return nt
+    return (platform.release() or "").strip() or "0.0"
+
+
 def _normalize_arch(machine: str) -> str:
     # process.arch 语义：arm64 / x64（官方取值）；其余按 64 位推断为 x64
     m = (machine or "").lower()
@@ -122,7 +228,7 @@ def collect_host_profile():
     return DeviceProfile(
         platform=_normalize_platform(platform.system()),
         arch=_normalize_arch(platform.machine()),
-        os_version=platform.release() or "0.0",
+        os_version=_resolve_os_version(),
         language=_resolve_language(),
         timezone=_resolve_timezone(),
         screen=FALLBACK_SCREEN,
