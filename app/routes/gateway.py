@@ -305,6 +305,60 @@ async def list_models():
     }
 
 
+def _estimate_tokens(body: dict) -> int:
+    """粗略估算 input tokens（system / messages / tools 都算）。
+
+    Claude Code 只拿这个数判断上下文余量，不要求精确；按 ASCII ~4 字符/token、CJK 等宽字符
+    ~1 字符/token 估。
+    """
+    chunks: list[str] = []
+    system = body.get("system")
+    if isinstance(system, str):
+        chunks.append(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                chunks.append(block["text"])
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if isinstance(block.get("text"), str):
+                    chunks.append(block["text"])
+                elif isinstance(block.get("content"), str):
+                    chunks.append(block["content"])
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict):
+            chunks.append(json.dumps(tool, ensure_ascii=False))
+    text = "\n".join(chunks)
+    ascii_n = sum(1 for ch in text if ord(ch) < 128)
+    wide_n = len(text) - ascii_n
+    return max(1, ascii_n // 4 + wide_n)
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_gateway_key)])
+async def count_tokens(request: Request):
+    """Anthropic 的 token 计数端点（本地估算）。
+
+    Claude Code 在发消息**之前**会先调它做上下文管理 —— 缺了它，客户端在真正发消息那一步
+    之前就失败，表现出来就是"Anthropic Messages 这条协议走不通"（2026-09-26 实测：
+    /v1/messages 本身返回 200，但这个端点 404）。上游 z.ai 没有对应端点，故本地估算。
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    return {"input_tokens": _estimate_tokens(body)}
+
+
 @router.post("/v1/messages", dependencies=[Depends(verify_gateway_key)])
 async def messages(request: Request):
     try:
