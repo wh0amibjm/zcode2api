@@ -8,7 +8,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import logs, reqlog
+from .. import logs, reqlog, settings
 from ..auth_admin import verify_admin_key
 from ..captcha import CaptchaSolveError
 from ..claim import (
@@ -366,7 +366,7 @@ def _schedule_auto_claim(account) -> None:
         if live is None:
             return
         try:
-            outcomes = await auto_claim_all_plans(live)
+            outcomes = await auto_claim_all_plans(live, initial_delay=settings.CLAIM_SETTLE_SECONDS)
             live = store.find(account.provider, account.id)
             if live is None:
                 return

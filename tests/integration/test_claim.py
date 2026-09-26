@@ -471,7 +471,7 @@ class TestAutoClaimOnPoolEntry:
         client, mock, _stub, _acc = claim_env
         called = []
 
-        async def _spy(account):
+        async def _spy(account, initial_delay=None):   # 入池调用会多传 settle 延迟
             called.append(account.id)
             return []
 
@@ -499,7 +499,7 @@ class TestAutoClaimOnPoolEntry:
         client, mock, _stub, _acc = claim_env
         called = []
 
-        async def _spy(account):
+        async def _spy(account, initial_delay=None):   # 入池调用会多传 settle 延迟
             called.append(account.id)
             return []
 

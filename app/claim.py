@@ -176,14 +176,21 @@ async def report_activation_events(account: Account) -> str | None:
     return None
 
 
-async def auto_claim_all_plans(account: Account) -> list[dict]:
+async def auto_claim_all_plans(account: Account, initial_delay: float | None = None) -> list[dict]:
     """新账号入池自动领取：激活上报 + 逐个领取全部可领套餐。
 
     入池链路的 fire-and-forget 收尾：任何失败只记日志/返回 outcome，绝不抛出
     （入池流程不受影响）。重复执行安全（上游 1003 已领取过幂等）。
+
+    `initial_delay`：入池那一次传 `settings.CLAIM_SETTLE_SECONDS` —— OAuth 刚拿到 JWT 时站点侧
+    （billing）可能还没同步完这个账号，**此刻打过去必然领不到**（2026-09-26 观察：同一批号里
+    有的领到、有的报失败，差别就在这几秒）。先等它落定，比撞了再重试更省事。周期轮询
+    （ClaimMonitor）不传 —— 那些账号早就稳定了。
     """
     if not (account.mode == "jwt" and account.jwt_token):
         return []
+    if initial_delay and initial_delay > 0:
+        await asyncio.sleep(initial_delay)
     outcomes: list[dict] = []
 
     try:
@@ -207,18 +214,32 @@ async def auto_claim_all_plans(account: Account) -> list[dict]:
         return outcomes
 
     for plan in plans:
-        try:
-            result = await claim(account, plan["plan_id"])
-            outcomes.append({"account_id": account.id, "account_name": account.name,
-                             "ok": True, **result})
-            logs.ok("claim", f"账号 {account.name} 自动领取成功: "
-                             f"{result.get('plan_name') or plan['plan_id']}")
-        except ClaimError as err:
-            outcomes.append({"account_id": account.id, "account_name": account.name,
-                             "ok": False, "plan_id": plan["plan_id"], "message": str(err)})
-            logs.warn("claim", f"账号 {account.name} 自动领取 {plan['plan_id']} 失败: {err}")
-        except Exception as err:  # noqa: BLE001
-            logs.warn("claim", f"账号 {account.name} 自动领取异常: {err}")
+        for attempt in (1, 2):
+            try:
+                result = await claim(account, plan["plan_id"])
+                outcomes.append({"account_id": account.id, "account_name": account.name,
+                                 "ok": True, **result})
+                logs.ok("claim", f"账号 {account.name} 自动领取成功: "
+                                 f"{result.get('plan_name') or plan['plan_id']}")
+                break
+            except ClaimError as err:
+                # 业务失败（已领取过 / 条件不符 / 名额用完）：上游的确定性回答，重试没有意义
+                outcomes.append({"account_id": account.id, "account_name": account.name,
+                                 "ok": False, "plan_id": plan["plan_id"], "message": str(err)})
+                logs.warn("claim", f"账号 {account.name} 自动领取 {plan['plan_id']} 失败: {err}")
+                break
+            except Exception as err:  # noqa: BLE001
+                # 瞬时失败：验证码预解池那侧的 pe 字节码 VM 会偶发 stall，solver 逐出缓存后
+                # 下一次就好（2026-09-26 实测：自动领取报"验证码求解失败"后，手动重跑立刻成功）。
+                # 这类失败重试一次就能吃回来，否则只能等下一个周期（6h）或人工点。
+                if attempt == 1:
+                    logs.warn("claim", f"账号 {account.name} 领取遇瞬时异常，"
+                                       f"{settings.CLAIM_RETRY_WAIT}s 后重试一次: {err}")
+                    await asyncio.sleep(settings.CLAIM_RETRY_WAIT)
+                    continue
+                outcomes.append({"account_id": account.id, "account_name": account.name,
+                                 "ok": False, "plan_id": plan["plan_id"], "message": str(err)})
+                logs.warn("claim", f"账号 {account.name} 自动领取异常: {err}")
     return outcomes
 
 

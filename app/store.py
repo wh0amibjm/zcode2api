@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 import time
@@ -32,8 +31,12 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
-        # 库文件的 mtime：用来分辨"这次改动是不是外面写的"（见 sync_from_disk）
-        self._db_mtime: float = 0.0
+        # 外部改动检测用的常驻连接（见 sync_from_disk）：PRAGMA data_version 只在**其他连接**
+        # 改动过库时才变，所以它天然区分"自己写的"和"外面写的"，也不受 WAL / mtime 精度影响
+        # —— 这两种信号都试过：WAL 下写入先进 -wal、主库 mtime 未必变；纳秒 mtime 在连续快速
+        # 改动时也会撞上。data_version 是 SQLite 为此提供的机制。
+        self._watch: sqlite3.Connection | None = None
+        self._db_mtime: int = 0
         self._init_db()
         self._load()
         self._stamp()
@@ -108,12 +111,28 @@ class Store:
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
 
-    def _stamp(self) -> None:
-        """记住库文件当前 mtime —— 自己写完要盖一下戳，免得下次读把它当成外部改动。"""
+    def _db_signature(self) -> int:
+        """外部改动指纹：常驻连接上的 `PRAGMA data_version`。
+
+        只读，不会触发同步；其他连接每次提交后它会 +1。自己写的改动不会让它变，所以不需要
+        "写后盖戳" 那套（早先的实现靠 mtime，先在 WAL 上漏检、后又在纳秒精度上撞车）。
+        """
         try:
-            self._db_mtime = os.path.getmtime(settings.DB_PATH)
-        except OSError:
-            self._db_mtime = 0.0
+            if self._watch is None:
+                # 惰性建：__init__ 里 _init_db() 才 mkdir，早于它连接会 "unable to open database file"
+                self._watch = self._connect()
+            row = self._watch.execute("PRAGMA data_version").fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def _stamp(self) -> None:
+        """记住库当前指纹。
+
+        用 data_version 之后其实不必在写后调用（它本就不因自己的写而变），保留是为了让
+        `_load()` 之后有个统一的"对齐基线"动作，语义上更清楚。
+        """
+        self._db_mtime = self._db_signature()
 
     def sync_from_disk(self) -> bool:
         """库被**外部进程**改过就重载，返回是否真的重载了。
@@ -125,22 +144,16 @@ class Store:
 
         顺带一起刷新的还有 `_settings` —— 所以后台改 gateway_key / admin_key 之类同样不必重启。
         """
-        try:
-            mtime = os.path.getmtime(settings.DB_PATH)
-        except OSError:
-            return False
-        if mtime == self._db_mtime:
+        sig = self._db_signature()
+        if not sig or sig == self._db_mtime:
             return False
         with self._lock:
             # 双检：等锁期间可能已被别的线程同步过
-            try:
-                mtime = os.path.getmtime(settings.DB_PATH)
-            except OSError:
-                return False
-            if mtime == self._db_mtime:
+            sig = self._db_signature()
+            if not sig or sig == self._db_mtime:
                 return False
             self._load()
-            self._db_mtime = mtime
+            self._db_mtime = sig
         return True
 
     def _persist_account(self, account: Account) -> None:

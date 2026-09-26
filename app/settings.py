@@ -69,6 +69,12 @@ CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 CLAIM_INTERVAL = _int("ZCODE_CLAIM_INTERVAL", 6 * 3600)  # 0 = 关闭周期领取
 CLAIM_STAGGER = _int("ZCODE_CLAIM_STAGGER", 5)           # 账号之间的间隔秒数
 CLAIM_START_DELAY = _int("ZCODE_CLAIM_START_DELAY", 60)  # 启动后首次检查的延迟
+# 领取遇瞬时异常（验证码预解池的 pe VM 偶发 stall）后的重试等待
+CLAIM_RETRY_WAIT = _int("ZCODE_CLAIM_RETRY_WAIT", 5)
+# 入池后到第一次领取之间的"等站点落定"延迟。OAuth 刚拿到 JWT 时，站点侧（billing）可能还没把
+# 这个账号同步过来，此刻打过去必然领不到 —— 2026-09-26 观察：同一批号里有的领到、有的报失败，
+# 差别就是这几秒。与其撞了再重试，不如先等它落定。
+CLAIM_SETTLE_SECONDS = _int("ZCODE_CLAIM_SETTLE_SECONDS", 30)
 
 # ── 额度耗尽试探窗 ───────────────────────────────────────────────────────────
 # 上游 free Start Plan 是日窗口，额度耗尽时 billing 会回落成空数组（失去「数字
