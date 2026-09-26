@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -31,8 +32,11 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        # 库文件的 mtime：用来分辨"这次改动是不是外面写的"（见 sync_from_disk）
+        self._db_mtime: float = 0.0
         self._init_db()
         self._load()
+        self._stamp()
 
     # ── SQLite 基础 ──────────────────────────────────────────────────────────
     def _connect(self) -> sqlite3.Connection:
@@ -104,6 +108,41 @@ class Store:
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
 
+    def _stamp(self) -> None:
+        """记住库文件当前 mtime —— 自己写完要盖一下戳，免得下次读把它当成外部改动。"""
+        try:
+            self._db_mtime = os.path.getmtime(settings.DB_PATH)
+        except OSError:
+            self._db_mtime = 0.0
+
+    def sync_from_disk(self) -> bool:
+        """库被**外部进程**改过就重载，返回是否真的重载了。
+
+        为什么需要：`cli.py login`、导出/导入脚本、后台工具都是**直接写这个库**的，而 store 是
+        内存缓存 —— 原先只在进程启动时 `_load()` 一次，于是新账号必须重启网关才可见
+        （实测：CLI 打印"已保存账号"，管理接口却仍只列旧账号）。读入口惰性检查 mtime 即可
+        根治：不需要 CLI 配合改造，也不需要额外轮询线程。
+
+        顺带一起刷新的还有 `_settings` —— 所以后台改 gateway_key / admin_key 之类同样不必重启。
+        """
+        try:
+            mtime = os.path.getmtime(settings.DB_PATH)
+        except OSError:
+            return False
+        if mtime == self._db_mtime:
+            return False
+        with self._lock:
+            # 双检：等锁期间可能已被别的线程同步过
+            try:
+                mtime = os.path.getmtime(settings.DB_PATH)
+            except OSError:
+                return False
+            if mtime == self._db_mtime:
+                return False
+            self._load()
+            self._db_mtime = mtime
+        return True
+
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
@@ -117,11 +156,13 @@ class Store:
                 ),
             )
             conn.commit()
+        self._stamp()   # 同上：不盖戳的话，写后紧接的读会误判成外部改动、白重载整个库
 
     def _delete_account(self, account_id: str) -> None:
         with closing(self._connect()) as conn:
             conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
             conn.commit()
+        self._stamp()   # 自己写的改动要盖戳，否则下次读会被误判成外部改动而白重载
 
     def _set_meta(self, key: str, value: str) -> None:
         with closing(self._connect()) as conn:
@@ -131,6 +172,7 @@ class Store:
             )
             conn.commit()
 
+        self._stamp()
     def save(self) -> None:
         """全量落库（兜底接口）。"""
         with self._lock:
@@ -169,16 +211,19 @@ class Store:
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
+        self.sync_from_disk()
         with self._lock:
             if provider:
                 return list(self._accounts.get(provider, []))
             return [a for p in PROVIDERS for a in self._accounts[p]]
 
     def find(self, provider: str, id_or_name: str) -> Account | None:
+        self.sync_from_disk()
         with self._lock:
             return self._find_locked(provider, id_or_name)
 
     def find_any(self, id_or_name: str) -> Account | None:
+        self.sync_from_disk()
         with self._lock:
             for p in PROVIDERS:
                 for a in self._accounts[p]:
@@ -256,6 +301,7 @@ class Store:
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
     def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
+        self.sync_from_disk()
         """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
         skip_ids = skip_ids or set()
         now = time.time()
