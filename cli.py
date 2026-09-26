@@ -83,20 +83,16 @@ async def cmd_login(args: list[str]) -> None:
             continue
         status = data.get("status")
         if status == "ready":
-            access_token = (data.get("zai") or {}).get("access_token")
             zcode_jwt = data.get("token")
             if zcode_jwt:
                 acc = store.add_account("zai", "oauth-login", zcode_jwt)
                 print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
                 await _cli_ingest_followup(acc)
-            if access_token:
-                try:
-                    key = await flow.exchange_api_key(access_token)
-                    acc_key = store.add_account("zai", "oauth-apikey", key)
-                    print(c(f"✔ 已兑换并保存 API Key: {key[:8]}...", "green"))
-                    await _cli_ingest_followup(acc_key)
-                except Exception as err:  # noqa: BLE001
-                    print(c(f"⚠️ 兑换 API Key 失败: {err}", "yellow"))
+            # 不再兑换 / 入池 API Key（2026-09-27 决定）：入池的那把 Key 会让网关在
+            # JWT 失效或命中风控后**自动回退**到 api.z.ai 通道（Account.has_apikey_fallback），
+            # 而这条回退通道不在使用范围内；池子里多出来的 oauth-apikey 条目也只是噪音。
+            # 兑换动作一并跳过 —— 它唯一的产物就是那把 Key，不存它就等于在上游白建一个
+            # 闲置 Key（会在门户里堆）。若要恢复，见 git 历史里本段的前一版。
             return
         if status == "failed":
             print(c("❌ 授权失败或被拒绝。", "red"))

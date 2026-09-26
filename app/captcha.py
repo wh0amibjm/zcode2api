@@ -25,6 +25,7 @@ from .store import store
 # 池参数（对齐 zapi：min 20-40 / max 120 过重，单账号网关用小池足矣）
 POOL_MIN = settings.CAPTCHA_POOL_MIN
 POOL_MAX = settings.CAPTCHA_POOL_MAX
+SOLVE_CONCURRENCY = settings.CAPTCHA_SOLVE_CONCURRENCY
 TOKEN_TTL_MS = settings.CAPTCHA_TOKEN_TTL  # 单枚 token 的最大可用时长（ms）
 
 
@@ -52,13 +53,37 @@ class CaptchaManager:
         self._pool: asyncio.Queue[_Token] = asyncio.Queue(maxsize=POOL_MAX)
         self._pool_size = 0          # Queue 无可信 len，自行维护
         self._refill_task: asyncio.Task | None = None
-        self._refilling = False
+        # 批次锁：同一时刻只允许一批补货在飞。热路径与后台循环都要走它 ——
+        # 池空时 N 个并发请求曾经**各自**同步求解（各起一个 Node 进程），
+        # 现在是排在同一个批次的锁上，批次内部按 _solve_sem 并发。
+        self._refill_lock = asyncio.Lock()
+        # 求解子进程的并发上限（跨批次共享，不能按批次新建，否则限流失效）
+        self._solve_sem = asyncio.Semaphore(SOLVE_CONCURRENCY)
         self._config_lock = asyncio.Lock()
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
         self._last_error: str | None = None
+        # 观测计数（管理端日志可读）：求解次数 / 成功数 / 累计求解秒数
+        self._solve_calls = 0
+        self._solve_ok = 0
+        self._solve_seconds = 0.0
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
+
+    def stats(self) -> dict:
+        """池与求解的近况（诊断热路径为什么慢时先看这个）。"""
+        avg = self._solve_seconds / self._solve_ok if self._solve_ok else 0.0
+        return {
+            "pool_size": self._pool_size,
+            "pool_min": POOL_MIN,
+            "pool_max": POOL_MAX,
+            "concurrency": SOLVE_CONCURRENCY,
+            "solve_calls": self._solve_calls,
+            "solve_ok": self._solve_ok,
+            "solve_success_rate": round(self._solve_ok / self._solve_calls, 3) if self._solve_calls else None,
+            "solve_avg_seconds": round(avg, 2),
+            "last_error": self._last_error,
+        }
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self) -> dict:
@@ -91,10 +116,17 @@ class CaptchaManager:
             self._refill_task = asyncio.create_task(self._refill_loop())
 
     async def close(self) -> None:
+        # 后台补充循环 + 热路径经 _kick_refill 起的补货任务，一起收 —— 只取消前者的话，
+        # 进程关停时正在求解的 Node 子进程会变成孤儿：Windows 上没人回收，还继续打上游。
+        tasks = [t for t in self._bg_tasks if not t.done()]
+        self._bg_tasks.clear()
         if self._refill_task and not self._refill_task.done():
-            self._refill_task.cancel()
+            tasks.append(self._refill_task)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             try:
-                await self._refill_task
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception:  # noqa: BLE001
@@ -120,12 +152,8 @@ class CaptchaManager:
                     await self._evict_expired()
                     await asyncio.sleep(3)
                     continue
-                need = POOL_MIN - self._pool_size
-                if need > 0:
-                    await self._refill_batch(need)
-                else:
-                    await self._evict_expired()
-                await asyncio.sleep(3)
+                await self._refill_once()
+                await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - 后台循环永不退出
@@ -133,22 +161,43 @@ class CaptchaManager:
                 logs.warn("captcha", f"补充循环异常: {err}")
                 await asyncio.sleep(5)
 
-    async def _refill_batch(self, need: int) -> None:
-        """串行补充（求解有 CPU 开销，避免并发爆 Node 进程）。"""
-        if self._refilling:
-            return
-        self._refilling = True
-        try:
+    async def _refill_once(self, floor: int = 0) -> int:
+        """补一批：算 need → 并发求解 → 入池；返回补到的枚数。
+
+        批次锁保证同一时刻只有一批在飞 —— 后台循环与热路径走同一条路，所以池空时
+        N 个并发请求只会起 SOLVE_CONCURRENCY 个子进程，而不是 N 个（此前热路径各自
+        同步求解，每个请求一个 Node 进程，池越空越雪崩）。
+
+        `floor` 是"够用线"：池里已有 >= floor 枚就直接返回。热路径传 1 —— 排在锁上的
+        第 2..N 个等待者醒来时货已被同批补上，不该再补一轮（否则每个等待者白等 2.4s）。
+        """
+        async with self._refill_lock:
+            await self._evict_expired()          # 先淘汰，need 才是真实缺口
+            if floor > 0 and self._pool_size >= floor:
+                return 0
+            need = POOL_MIN - self._pool_size
+            if need <= 0:
+                return 0
             config = await self.fetch_config()
-            for _ in range(need):
-                if self._pool_size >= POOL_MAX:
-                    break
-                token = await self._solve_one(config)
-                if token is None:
-                    break
-                self._put(token)
-        finally:
-            self._refilling = False
+            n = min(need, POOL_MAX - self._pool_size)
+            if n <= 0:
+                return 0
+            results = await asyncio.gather(
+                *(self._solve_guarded(config) for _ in range(n)),
+                return_exceptions=True,
+            )
+            got = 0
+            for res in results:
+                if isinstance(res, _Token):
+                    self._put(res)
+                    got += 1
+            return got
+
+    async def _solve_guarded(self, config: dict) -> _Token | None:
+        """受并发上限约束的求解。信号量是实例级的（跨批次共享）——
+        按批次新建就等于没限流。"""
+        async with self._solve_sem:
+            return await self._solve_one(config)
 
     def _put(self, token: _Token) -> None:
         try:
@@ -170,12 +219,8 @@ class CaptchaManager:
         for token in kept:
             self._put(token)
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
-        """取一枚可用 token：优先池内现成的（跳过过期），池空才同步现解。
-
-        返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
-        """
-        # 1) 池内直取
+    def _take(self) -> _Token | None:
+        """从池里取一枚未过期的 token（过期的顺手丢弃）。"""
         while self._pool_size > 0:
             try:
                 token = self._pool.get_nowait()
@@ -183,18 +228,41 @@ class CaptchaManager:
                 break
             self._pool_size = max(0, self._pool_size - 1)
             if not token.expired():
-                # 触发后台补货（fire-and-forget；_refilling 防重入，强引用防 GC）
-                task = asyncio.create_task(self._refill_batch(1))
-                self._bg_tasks.add(task)
-                task.add_done_callback(self._bg_tasks.discard)
-                return token.param, token.region
+                return token
+        return None
 
-        # 2) 池空/全过期：同步现解一次（首启兜底；正常情况下后台循环已预热）
-        config = await self.fetch_config()
-        token = await self._solve_one(config)
-        if token is None:
-            raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
-        return token.param, token.region
+    def _kick_refill(self) -> None:
+        """确保有一批补货在飞（幂等）。批次锁已经保证不会真的跑两批，
+        这里只避免为每个请求都建一个必然空转的 task。"""
+        if self._refill_lock.locked():
+            return
+        task = asyncio.create_task(self._refill_once())
+        self._bg_tasks.add(task)             # 事件循环只持弱引用，裸 task 会被 GC
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+        """取一枚可用 token：优先池内现成的（跳过过期），池空才等一轮共享补货。
+
+        返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
+        """
+        # 1) 池内直取（热路径，亚毫秒）
+        token = self._take()
+        if token is not None:
+            self._kick_refill()              # 取走一枚就补回一枚
+            return token.param, token.region
+
+        # 2) 池空：等一轮共享补货。并发请求在这里排队等**同一批**求解，
+        #    而不是各自起一个 Node 进程 —— 这是并发不雪崩的关键。
+        await self._refill_once(floor=1)
+        token = self._take()
+        if token is not None:
+            self._kick_refill()
+            return token.param, token.region
+
+        # 3) 补货也没补到（求解器故障 / 上游风控）：池与求解的近况一起进日志 ——
+        #    这是诊断"池为什么空/为什么慢"唯一的现场，别只留一句"失败"。
+        logs.warn("captcha", f"池空且补货未果 {self.stats()}")
+        raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def _solve_one(self, config: dict) -> _Token | None:
@@ -202,6 +270,8 @@ class CaptchaManager:
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
 
+        self._solve_calls += 1
+        t0 = time.monotonic()
         last_err: str | None = None
         for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
             try:
@@ -210,13 +280,19 @@ class CaptchaManager:
                 last_err = str(err)
                 param = None
             if param:
+                elapsed = time.monotonic() - t0
+                self._solve_ok += 1
+                self._solve_seconds += elapsed
                 if attempt > 1:
-                    logs.ok("captcha", f"求解成功（第 {attempt} 次尝试）")
+                    logs.ok("captcha", f"求解成功（第 {attempt} 次尝试，{elapsed:.1f}s）")
                 return _Token(param, region)
             self._last_error = last_err
             logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
 
-        logs.warn("captcha", f"求解失败: {last_err or '多次重试无结果'}")
+        logs.warn(
+            "captcha",
+            f"求解失败（耗时 {time.monotonic() - t0:.1f}s）: {last_err or '多次重试无结果'}",
+        )
         return None
 
     async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:
@@ -233,6 +309,13 @@ class CaptchaManager:
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+        except asyncio.CancelledError:
+            # 关停时被取消：子进程必须先杀掉再抛出，否则它继续跑完并打上游
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
         except TimeoutError:
             try:
                 proc.kill()

@@ -150,6 +150,7 @@ async def lifespan(app: FastAPI):
         await monitor.stop()
         await claim_monitor.stop()
         await captcha_manager.close()
+        await gateway.aclose_client()   # 共享上游客户端（连接池）在进程退出时收口
 
 
 def create_app() -> FastAPI:

@@ -152,7 +152,12 @@ function noteStallAndMaybeEvict(peUrl) {  try {
 const peVmCallRegex =
   /55==A\?\(f=r\[n\+\+\],l=e\.pop\(\),h=e\.pop\(\),o=\[\],\w+\(f\)\.forEach\(function\(\)\{o\.unshift\(e\.pop\(\)\)\}\),p=null===h\?l\.apply\((\w+),o\):h\[l\]\.apply\(h,o\),r\[n\+\+\]&&e\.push\(p\)\):/;
 function patchPeBundle(buf, url) {
-  if (process.env.PE_PATCH === "off") return buf;
+  // 默认关闭（2026-09-27 实测）：钩子注入后 pe VM 会卡死，症状是 [pe-stall] + 整轮
+  // 求解超时。同一台机器、串行同参数各 4 次对照：
+  //   关闭 = 4/4 成功、2.2–2.6s；开启 = 1/3 成功、失败时 8.3s。
+  // 钩子写的 window.__DBT 在仓库里没有任何消费方（纯排障用途），故改为 opt-in：
+  // 需要看 btoa/atob 入参时用 PE_PATCH=on 显式打开。
+  if (process.env.PE_PATCH !== "on") return buf;
   if (!/dynamicJS\/[^/]*\/pe\.\d+\./.test(url)) return buf;
   let src = buf.toString("utf8");
   if (src.includes("__DBT")) return buf;

@@ -54,8 +54,20 @@ DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
 # 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）
-CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则补）
-CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
+#
+# 2026-09-27 上调（原 min 3 / max 10，补货串行）：池就是吞吐天花板 —— 每个走
+# Plan 通道的请求消耗 1 枚 token，而原配置下补货是串行的、且每次求解都跑一个
+# Node 子进程。实测（PE_PATCH 修复后）单次求解 2.4s、成功率 100%，并发 6 路
+# 几乎线性（求解是 IO 等待型：8.5s 挂钟只烧 0.046s user 时间），所以把库存和
+# 并发都放开。min 12 对应"后台预热到 12 枚后才接客"，max 48 是内存与上游礼貌
+# 的上限（每枚 ~300B）。
+CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 12)       # 目标库存（低于则补）
+CAPTCHA_POOL_MAX = max(1, _int("CAPTCHA_POOL_MAX", 48))  # 池上限（0 = asyncio 无限队列，不是"禁用"）
+# 同一时刻在飞的求解子进程数。调高 = 补货快 + CPU/上游压力大；6 在 20 核机器上
+# 实测无压力（子进程绝大多数时间在等网络）。上游若对高频 init 风控，先降这个。
+# 下界 1：0 会让 Semaphore(0) 永久阻塞 —— 症状不是报错而是**所有 Plan 通道请求静默挂起**，
+# 那种失败模式比配置写错本身难查得多。
+CAPTCHA_SOLVE_CONCURRENCY = max(1, _int("CAPTCHA_SOLVE_CONCURRENCY", 6))
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
@@ -63,10 +75,15 @@ CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 # 活动是分批投放的（同一账号的 preview 会先后出现不同场次），入池时领一次会漏。
 # 周期检查并自动领取；billing/* 是上游 WAF 风险点，故节拍拉长 + 账号间错峰。
 #
-# 默认 6 小时（2026-09-26 上调，原 1800s）：那天 30 分钟一轮的 billing 与注册链路共用
-# 同一批出口 IP，高频查询把出口打到被上游丢包封锁（z.ai 全域名超时、其它站点正常）。
-# 活动以「天」计，6 小时一轮足够吃到新场次，又把流量压到 1/12。
-CLAIM_INTERVAL = _int("ZCODE_CLAIM_INTERVAL", 6 * 3600)  # 0 = 关闭周期领取
+# 默认 1 小时（2026-09-27 下调，原 6 小时）：活动是**分批投放**的 —— 09-26 实测同一账号的
+# preview 先只有 0926 场次，十几分钟后才出现 0924-wk-2。6 小时一轮意味着新活动最长要等 6
+# 小时才被领到，实际表现就是"总要去后台手点一次"。
+# 当初上调到 6 小时的理由（30 分钟一轮的 billing 与注册链路共用同一批出口 IP，高频查询把
+# 出口打到被上游丢包封锁）已部分失效：扩号改直连后不再与网关共用出口。
+# 流量账：账号数 × 1 次 preview/轮，1 小时一轮 ≈ 每号 1 次/小时。
+# 不建议再往下压（15 分钟 = 每号 4 次/小时）：billing 的 WAF 安全上界我们只有 09-26 那一次
+# 封禁数据点，没有第二组可以界定"安全线"。
+CLAIM_INTERVAL = _int("ZCODE_CLAIM_INTERVAL", 3600)  # 0 = 关闭周期领取
 CLAIM_STAGGER = _int("ZCODE_CLAIM_STAGGER", 5)           # 账号之间的间隔秒数
 CLAIM_START_DELAY = _int("ZCODE_CLAIM_START_DELAY", 60)  # 启动后首次检查的延迟
 # 领取遇瞬时异常（验证码预解池的 pe VM 偶发 stall）后的重试等待
@@ -106,6 +123,10 @@ RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒�
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 上游连接复用（默认开）。关掉退回"每请求新建 AsyncClient"的旧行为 ——
+# 留这个开关是因为"共享连接池会不会让上游按连接归类"尚未实测；
+# 症状若是风控/异常响应变多，设 ZCODE_HTTP_REUSE=0 即可对照。
+HTTP_REUSE = os.getenv("ZCODE_HTTP_REUSE", "1").strip().lower() not in ("0", "false", "off", "no")
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖

@@ -38,6 +38,10 @@ class Store:
         self._watch: sqlite3.Connection | None = None
         self._db_mtime: int = 0
         self._init_db()
+        # 常驻 watch 连接在这里就建好 —— `_init_db()` 已确保目录存在。惰性建的话，
+        # 两个并发读者可能同时走到"发现是 None"那一步，各自建一条连接，其中一条被
+        # 赋值覆盖后永不 close()，泄漏一个 SQLite 句柄。
+        self._watch = self._connect()
         self._load()
         self._stamp()
 
@@ -99,28 +103,54 @@ class Store:
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
             self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
 
-            self._accounts = {p: [] for p in PROVIDERS}
+            # 就地刷新，**不整体替换** Account 对象：`_dispatch`/`_try_account` 在做请求时
+            # 持有 Account 引用，替换会让它们在结束时用旧快照 INSERT OR REPLACE 写回，
+            # 把外部刚写入的状态（enabled/jwt）与本进程期间累积的 use_count/fail_count/
+            # risk_strikes/额度刷新一起回退。热同步（sync_from_disk）被设计成"外部写库后
+            # 无需重启"，而扩容正是每隔几分钟就写一次库 —— 不做这一步，外部写得越勤、
+            # 回退窗口越多。
+            existing = {a.id: a for accounts in self._accounts.values() for a in accounts}
+            rebuilt: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
             rows = conn.execute(
                 f"SELECT data FROM {_TBL} ORDER BY created_at ASC"
             ).fetchall()
             for row in rows:
                 try:
-                    account = Account.from_dict(json.loads(row["data"]))
-                except (json.JSONDecodeError, TypeError):
+                    data = json.loads(row["data"])
+                except json.JSONDecodeError:
                     continue
-                if account.provider in self._accounts:
-                    self._accounts[account.provider].append(account)
+                if not isinstance(data, dict):
+                    continue
+                account = existing.get(data.get("id"))
+                if account is None:
+                    try:
+                        account = Account.from_dict(data)
+                    except TypeError:
+                        continue
+                else:
+                    for key, value in data.items():
+                        if key not in Account.__dataclass_fields__:
+                            continue
+                        if key == "recent_results":
+                            # 这个字段不落库（record_result 只改内存），磁盘上那份是旧的：
+                            # 直接用磁盘值会把本进程刚记录的请求明细抹掉。取更完整的一份。
+                            if len(value or []) > len(account.recent_results or []):
+                                account.recent_results = value
+                            continue
+                        setattr(account, key, value)
+                if account.provider in rebuilt:
+                    rebuilt[account.provider].append(account)
+            self._accounts = rebuilt
 
     def _db_signature(self) -> int:
         """外部改动指纹：常驻连接上的 `PRAGMA data_version`。
 
         只读，不会触发同步；其他连接每次提交后它会 +1。自己写的改动不会让它变，所以不需要
         "写后盖戳" 那套（早先的实现靠 mtime，先在 WAL 上漏检、后又在纳秒精度上撞车）。
+
+        连接在 `__init__` 里就建好了（见那里的注释），此处不再惰性建。
         """
         try:
-            if self._watch is None:
-                # 惰性建：__init__ 里 _init_db() 才 mkdir，早于它连接会 "unable to open database file"
-                self._watch = self._connect()
             row = self._watch.execute("PRAGMA data_version").fetchone()
             return int(row[0]) if row else 0
         except sqlite3.Error:
@@ -314,8 +344,8 @@ class Store:
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
     def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        self.sync_from_disk()
         """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+        self.sync_from_disk()
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:

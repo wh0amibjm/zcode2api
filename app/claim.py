@@ -439,6 +439,11 @@ class ClaimMonitor:
     async def stop(self) -> None:
         self._stop.set()
         if self._task:
+            # 必须 cancel，光 set 事件停不下来：`run_once()` 里的 billing 网络请求、
+            # 以及账号之间的错峰等待（CLAIM_STAGGER）都不检查 `_stop`，于是一次 6 小时
+            # 周期的关停会被阻塞到整轮跑完（账号数 × stagger + 每账号请求耗时，分钟级）。
+            # 领取本身幂等（上游回 1003 已领取过），中断安全。
+            self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 

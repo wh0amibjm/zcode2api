@@ -28,6 +28,68 @@ _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染�
 
 router = APIRouter()
 
+# ── 上游 HTTP 客户端 ─────────────────────────────────────────────────────────
+# 此前**每个请求**新建 httpx.AsyncClient（`_try_account` 内），代价是每请求一次
+# TCP+TLS 握手、连接池现建现扔；流式长回复下这条连接本身还能活数分钟，白建白扔
+# 尤其浪费。复用的另一半理由在指纹层：官方客户端本来就保持长连接，每请求新建
+# 反而是异常特征。
+#
+# 连接池按 (scheme, host, port) 复用，**账号身份在 header 层**（build_request 逐请求
+# 构造 jwt/api-key/指纹头），所以不会串味；一条 HTTP/1.1 连接同一时刻也只服务一个
+# 请求。若上游确实按连接归类（未实测），用 ZCODE_HTTP_REUSE=0 退回每请求新建。
+_HTTP_REUSE = settings.HTTP_REUSE
+
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
+_UPSTREAM_LIMITS = httpx.Limits(max_connections=200, max_keepalive_connections=64)
+_upstream_client: httpx.AsyncClient | None = None
+_upstream_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    """上游客户端。
+
+    默认返回**共享单例**：连接复用，且绑定事件循环 —— httpx 把连接池挂在创建时的
+    loop 上，跨 loop 复用会直接报错，所以 loop 变了就重建（生产只有一个 loop，这个
+    分支永不触发；测试每条用例一个新 loop，正是靠它拿到干净实例）。
+
+    `ZCODE_HTTP_REUSE=0` 时返回**每请求一个独立实例**。这个分支必须在这里分叉：
+    `_release_client` 在回退模式下会 `aclose()` 掉传进去的客户端，若它拿到的是共享
+    单例，就会在别的并发请求正读流时把客户端关掉。
+    """
+    global _upstream_client, _upstream_client_loop
+    if not _HTTP_REUSE:
+        return httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if (_upstream_client is None or _upstream_client.is_closed
+            or _upstream_client_loop is not loop):
+        _upstream_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+        _upstream_client_loop = loop
+    return _upstream_client
+
+
+async def _release_client(client: httpx.AsyncClient) -> None:
+    """关客户端 —— 只关"每请求新建"的回退路径；共享单例留给 lifespan 收口。"""
+    if not _HTTP_REUSE:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 - 关闭失败不该掩盖真实错误
+            pass
+
+
+async def aclose_client() -> None:
+    """进程退出时收口共享客户端（main.lifespan 调用）。"""
+    global _upstream_client, _upstream_client_loop
+    client, _upstream_client = _upstream_client, None
+    _upstream_client_loop = None
+    if client is not None and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 
@@ -144,8 +206,11 @@ def _is_risk_control(status_code: int, text: str) -> bool:
 # 5xx），而不是另起一套错误处理 —— 判定口径与真实 4xx 完全同源。
 _NORMALIZED_EXHAUST = 402   # 落 EXHAUST_HTTP_STATUSES
 _NORMALIZED_RISK = 405      # 落 RISK_CONTROL_HTTP_STATUSES
-_NORMALIZED_CAPTCHA = 400   # 配合 _detect_captcha_challenge 的 body 3007 判定
-_NORMALIZED_OTHER = 502     # 未知业务码：按上游故障重试 / 冷却
+_NORMALIZED_CAPTCHA = 400   # 走 challenge 分支：清池换码重试（按 body 的 code==3007 判定）
+# 未知业务码：按**确定性错误**处理，落下方"其它 4xx"分支（回传客户端、不重试、不冷却）。
+# 早先映射成 502 是错的：未知 code 多半是参数/契约类错误，重试与冷却都是无效动作，
+# 还会把一个健康账号关进 COOLING_SECONDS 的冷却里。
+_NORMALIZED_OTHER = 400
 
 
 async def _sniff_business_error(resp: httpx.Response) -> tuple[int | None, bytes | None]:
@@ -165,12 +230,21 @@ async def _sniff_business_error(resp: httpx.Response) -> tuple[int | None, bytes
     code = body.get("code")
     if not isinstance(code, int) or code == 0:
         return None, raw                      # 无业务码 = 正常响应
-    low = text.lower()
+
+    # 关键词只在 msg/message 字段里找，**不扫全文**：2xx 的响应体天然带 balance /
+    # quota / expires_at 这类字段名，按子串扫全文会把成功响应判成额度耗尽 ——
+    # 后果是一个健康账号被标 EXHAUSTED、带着试探窗退出轮询，而请求其实成功了。
+    low = str(body.get("msg") or body.get("message") or "").lower()
+
     if code == 1005 or any(k in low for k in _EXHAUST_KEYWORDS):
         return _NORMALIZED_EXHAUST, raw
-    if any(m in low for m in constants.RISK_CONTROL_MARKERS):
+    if any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS):
         return _NORMALIZED_RISK, raw
-    if _detect_captcha_challenge(resp, text):
+    # 验证码挑战按 code 直判，不走 _detect_captcha_challenge：那条 body 分支要求
+    # status in (400,403)，而本函数只在 2xx 时被调用，靠它等于这条分支永远不可达。
+    # 不可达的代价很具体：200+3007 不清池、不换码，反而落进未知码分支让健康账号
+    # 被 5xx 重试后冷却，下一轮继续拿同一批已失效的 token 撞。
+    if code == 3007:
         return _NORMALIZED_CAPTCHA, raw
     return _NORMALIZED_OTHER, raw
 
@@ -488,12 +562,7 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str, rid: str,
             yield "event: response.created\ndata: " + json.dumps({**base, "status": "in_progress", "output": []}) + "\n\n"
             yield "event: response.output_item.added\ndata: " + json.dumps({**base, "output_index": 0, "item": {"id": mid, "type": "message", "status": "in_progress", "role": "assistant", "content": []}}) + "\n\n"
             yield "event: response.content_part.added\ndata: " + json.dumps({**base, "item_id": mid, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}) + "\n\n"
-            async for line in up.resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                evt = _safe_json(line[5:].strip())
-                if not isinstance(evt, dict):
-                    continue
+            async for evt in _sse_events(up):
                 for chunk in conv.feed(evt):
                     delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
                     piece = delta.get("content")
@@ -601,16 +670,11 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
     async def _iter():
         try:
             yield conv.start()
-            async for line in up.resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if not data_str:
-                    continue
-                evt = _safe_json(data_str)
-                if isinstance(evt, dict):
-                    for out in conv.feed(evt):
-                        yield out
+            # 事件来源统一走 _sse_events：上游忽略 stream（体被业务码嗅探预读）时，
+            # 它会把那份 JSON 还原成等效事件，而不是让我们迭代一个已读空的流。
+            async for evt in _sse_events(up):
+                for out in conv.feed(evt):
+                    yield out
             yield conv.done()
             logs.req_ok(req_id)
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
@@ -781,7 +845,8 @@ class _Upstream:
             return
         self._closed = True
         await self.cm.__aexit__(None, None, None)
-        await self.client.aclose()
+        # 共享客户端不在这里关：退出流上下文就已把连接归还池（这正是复用的意义）。
+        await _release_client(self.client)
         if self.on_close is not None:
             try:
                 self.on_close()
@@ -813,6 +878,47 @@ class _Upstream:
         return StreamingResponse(_body_iter(), status_code=up.resp.status_code,
                                  media_type=up.resp.headers.get("content-type", "application/json"),
                                  headers={"Cache-Control": "no-cache"})
+
+
+def _preloaded_sse_events(raw: bytes) -> list[dict]:
+    """把"上游忽略 stream 参数、直接回了 200 JSON"的那份响应体还原成 Anthropic SSE 事件。
+
+    为什么需要：`_sniff_business_error` 在 2xx 时预读整个响应体判业务码，读走之后
+    上游流里已经没有任何内容。流式路径靠 `conv.feed(evt)` 吃饭，若直接去迭代那个
+    空流，客户端会收到一个"有头无正文"的流（只 start + done），而 reqlog 还记成功。
+    """
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict):
+        return []
+    head = {k: v for k, v in data.items() if k != "content"}
+    events: list[dict] = [{"type": "message_start", "message": head}]
+    for idx, block in enumerate(data.get("content") or []):
+        if not isinstance(block, dict):
+            continue
+        events.append({"type": "content_block_start", "index": idx, "content_block": block})
+        if block.get("type") == "text" and block.get("text"):
+            events.append({"type": "content_block_delta", "index": idx,
+                           "delta": {"type": "text_delta", "text": block["text"]}})
+        events.append({"type": "content_block_stop", "index": idx})
+    events.append({"type": "message_delta",
+                   "delta": {"stop_reason": data.get("stop_reason"), "stop_sequence": None},
+                   "usage": data.get("usage") or {}})
+    events.append({"type": "message_stop"})
+    return events
+
+
+async def _sse_events(up: "_Upstream"):
+    """流式路径的统一事件来源：正常情况下逐行读上游 SSE；体已被预读走时走还原路径。"""
+    if up.preloaded is not None:
+        for evt in _preloaded_sse_events(up.preloaded):
+            yield evt
+        return
+    async for line in up.resp.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        evt = _safe_json(line[5:].strip())
+        if isinstance(evt, dict):
+            yield evt
 
 
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
@@ -865,12 +971,12 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        client = _client()
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
-            await client.aclose()
+            await _release_client(client)
             account.record_result(False, f"连接失败: {err}")
             # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
             if account.status in (Status.INVALID, Status.DISABLED):
@@ -900,7 +1006,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         if status_code >= 400:
             text = (preloaded if preloaded is not None else await resp.aread()).decode("utf-8", "ignore")
             await cm.__aexit__(None, None, None)
-            await client.aclose()
+            await _release_client(client)
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
