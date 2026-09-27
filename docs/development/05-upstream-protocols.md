@@ -160,3 +160,45 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 ```
 
 `appVersion` 必须可打印 ASCII，非法值静默回退默认；`X-Device-Mid` 永不逐请求随机（防指纹抖动）。
+
+---
+
+## 9. 3012 判级：模型级 ≠ 账号级（2026-09-28 实证）
+
+> 同节的 2026-09-27「Plan 通道加 `x-session-id`」事故档案在 `main` 上，合并时并入本节。
+> 两次是**同一个错误码的两个不同原因**，别把结论混用。
+
+**现象**：`GLM-5.3` 请求全部 HTTP 405 + `{"code":3012,"msg":"request has been blocked due to unusual activity."}`，
+而同一账号、同一时刻、同一枚新解验证码的 `GLM-5.3-Flash` 正常 200。池内 20/21 账号被
+`ban_for_risk()` 置 DISABLED（该分支按设计不自愈），触发窗口 2026-09-28 03:10:23–03:15:33 —— **五个请求抽干整池**。
+
+**实测判据**（`experiments/probe_3012_rootcause.py`、`probe_glm53_order.py`）：
+
+| 臂 | 模型 | 结果 |
+|---|---|---|
+| 同账号，先打被拦模型 | GLM-5.3 | 405 · `code=3012` |
+| 紧接同账号 | GLM-5.3-Flash | **200 出话** |
+| 另一个冷账号，反序 | Flash → GLM-5.3 | **200** → 405 |
+| 同账号 | GLM-5.2 | 400 · `code=3006 model not allowed`（走的是另一条码） |
+| 裸最小 body / 加官方身份块 / 小写 `glm-5.3` | GLM-5.3 | 全部 3012 ⇒ **与请求体形态无关，只看模型名** |
+
+额度单（`billing/current`）里 `ent ... 0817 ... capabilities=["model:glm-5.3"]` 300 万日窗口
+`ends_at` 未过期、`0927` 只有 `model:glm-5.3-flash` 1 亿。**额度单承认这个模型，但 WAF 不放行** ——
+所以它没走 3006「模型不允许」那条路，直接落 3012。热账号（uses 131/196）连 Flash 也 3012，
+那是反复 3012 之后账号真被盯上的**后果**，不是原因。
+
+**结论 / 规则**：
+
+1. `405 + 3012` 有两种语义，**不能一律当账号级**：模型级（账号健康）与账号级（账号被盯上）。
+   判级手段：命中 3012 后用**同账号**补发一发 `GLM-5.3-Flash` 探针 —— 探针 200 即证明账号健康。
+2. 判级无据（探针吃 5xx / 取码失败）时**冷却，不封号**：误封不可自愈、误冷却会自愈。
+   与「403 不再无条件判 invalid」是同一条既有修正。
+3. 模型级命中的处置是**熔断模型**（`ZCODE_MODEL_BLOCK_SECONDS`，默认 900s，到期自动再试），
+   熔断期内同模型请求在 `_dispatch` 就被拒（400 `model_blocked`），零上游流量、零验证码消耗。
+   退出开关 `ZCODE_MODEL_BLOCK_PROBE=0` 可退回旧行为做对比。
+4. 已判为模型级的模型**不要**再写进客户端的默认模型；上游策略是服务端的，客户端换模型才有解。
+
+**回归锁定**：`tests/integration/test_gateway_model_block.py`（12 条，含账号级/模型级/判级无据三态
+与「熔断期零上游流量」）＋ `tests/unit/test_model_block.py`（5 条状态机）。
+**误杀恢复**：`POST /admin/api/accounts/risk-reset`（批量，只认 enabled=True 且 DISABLED 的风控形态，
+后台手动停用的号不会被顺手打开）。

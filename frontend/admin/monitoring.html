@@ -29,6 +29,8 @@
     </div>
   </div>
 
+  <div id="model-blocks" style="display:none"></div>
+
   <div class="filter-bar" id="filter-bar">
     <div class="filter-chips" id="range-chips"></div>
     <input class="input mon-search" id="search" placeholder="搜索账号、模型、内容、错误…" oninput="onSearch(this.value)">
@@ -233,11 +235,46 @@ function setTab(t){tab=t;document.querySelectorAll('.mon-tab').forEach(b=>b.clas
 function onSearch(v){state.q=v;render();}
 function onStatus(v){state.status=v;render();}
 
+function renderBlocks(blocks){
+  const box=$('model-blocks');
+  if(!blocks.length){box.style.display='none';box.innerHTML='';return;}
+  box.style.display='block';
+  box.style.margin='0 0 16px';
+  box.style.padding='10px 14px';
+  box.style.border='1px solid var(--amber,#d99a2b)';
+  box.style.borderRadius='8px';
+  box.style.background='color-mix(in srgb, var(--amber,#d99a2b) 10%, transparent)';
+  box.style.fontSize='13px';
+  box.innerHTML=blocks.map(b=>{
+    const m=Math.floor(b.remaining/60), s=b.remaining%60;
+    const left=m>0?`${m} 分 ${s} 秒`:`${s} 秒`;
+    return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <strong>模型熔断</strong>
+      <code>${b.model}</code>
+      <span style="opacity:.8">上游 3012 拦截该模型（同账号其它模型健康，账号未被禁用）· 剩 ${left}</span>
+      <button class="page-action-btn" style="margin-left:auto" onclick="doClearBlocks()">立即解除</button>
+    </div>`;
+  }).join('');
+}
+
+let modelBlocks=[];
+
 async function load(){
   const res=await api('GET','/monitoring');
   entries=res.entries||[];
   state.keep=res.keep||500;
+  modelBlocks=res.model_blocks||[];
+  renderBlocks(modelBlocks);
   render();
+}
+async function doClearBlocks(){
+  try{
+    await api('POST','/model-blocks/clear');
+    showToast('已解除模型熔断','success');
+    await load();
+  }catch{
+    showToast('解除失败','error');
+  }
 }
 function doRefresh(){load().catch(()=>showToast('加载失败','error'));}
 async function doClear(){

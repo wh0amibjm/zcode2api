@@ -54,8 +54,8 @@ DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
 # 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）
-CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则补）
-CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
+CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 20)        # 目标库存（低于则补）
+CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 40)       # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
@@ -87,6 +87,18 @@ CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
 CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / "solver.js"
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
+# 补货并发度。单次求解 8~10s 挂钟但只烧 ~0.05s CPU（等 Node + 上游校验，IO 型），
+# 所以并发才是对的：串行补 20 枚要 200s+，而 token 自身 TTL 只有 95s —— 串行补货
+# 连池子都填不满，池子长期贴在 0，每个请求都退回「同步现解」，首 token 多出 10~60s。
+CAPTCHA_SOLVE_CONCURRENCY = _int("ZCODE_CAPTCHA_SOLVE_CONCURRENCY", 6)
+# 池空时单个请求的等待上限（秒）。等的是**第一枚**落池：批次并发跑，第一枚
+# ~10s 到手；一次求解要重试 4 轮，所以留出重试余量后给 60s 兜底。
+CAPTCHA_COLD_WAIT = _int("ZCODE_CAPTCHA_COLD_WAIT", 60)
+
+# ── 上游连接复用 ─────────────────────────────────────────────────────────────
+# 1 = 复用模块级共享 AsyncClient（连接池 + TLS 会话复用）；0 = 每请求新建。
+# 账号身份在 header 层（build_request 逐请求构造），池按 host 复用不串味。
+HTTP_REUSE = _int("ZCODE_HTTP_REUSE", 1)
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
@@ -104,6 +116,14 @@ RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
 # 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# ── 3012 判级 + 模型级熔断（2026-09-28 实证）──────────────────────────────────
+# 上游的 405+3012「unusual activity」有两种语义：账号级（账号被盯上）与模型级
+# （该模型被策略拦下、账号健康）。原实现只认前者，于是每个 GLM-5.3 请求都禁用掉
+# 一个账号（2026-09-28 03:10–03:15，五个请求抽干 20 个号）。
+# 现在命中 3012 后用同账号补发一发 Flash 探针判级；判为模型级则熔断该模型
+# MODEL_BLOCK_SECONDS，账号保持可用（详见 app/routes/gateway.py 顶部注释）。
+MODEL_BLOCK_PROBE = _int("ZCODE_MODEL_BLOCK_PROBE", 1)        # 0 = 关闭判级（退回"3012 一律封号"）
+MODEL_BLOCK_SECONDS = _int("ZCODE_MODEL_BLOCK_SECONDS", 900)  # 模型级熔断时长（到期自动再试一次）
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 

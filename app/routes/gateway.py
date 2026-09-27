@@ -28,6 +28,61 @@ _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染�
 
 router = APIRouter()
 
+# ── 上游 HTTP 客户端（连接复用）──────────────────────────────────────────────
+# 此前**每个请求**新建 httpx.AsyncClient：每请求一次 TCP+TLS 握手，而流式长回复下
+# 这条连接本身能活数分钟，白建白扔。复用还有一层指纹理由：官方客户端本来就保持长连接。
+# 连接池按 (scheme, host, port) 复用，账号身份在 header 层（build_request 逐请求构造），
+# 故不串味；一条 HTTP/1.1 连接同一时刻只服务一个请求。
+# 若上游确实按连接归类（未实测），`ZCODE_HTTP_REUSE=0` 退回每请求新建。
+_HTTP_REUSE = settings.HTTP_REUSE
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
+_UPSTREAM_LIMITS = httpx.Limits(max_connections=200, max_keepalive_connections=64)
+_upstream_client: httpx.AsyncClient | None = None
+_upstream_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    """上游客户端：默认共享单例，回退模式每请求新建。
+
+    共享实例**绑定事件循环** —— httpx 把连接池挂在创建时的 loop 上，跨 loop 复用
+    直接报错，所以 loop 变了就重建（生产只有一个 loop，这分支永不触发；测试每条
+    用例一个新 loop，正是靠它拿到干净实例）。
+    """
+    global _upstream_client, _upstream_client_loop
+    if not _HTTP_REUSE:
+        return httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if (_upstream_client is None or _upstream_client.is_closed
+            or _upstream_client_loop is not loop):
+        _upstream_client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, limits=_UPSTREAM_LIMITS)
+        _upstream_client_loop = loop
+    return _upstream_client
+
+
+async def _release_client(client: httpx.AsyncClient) -> None:
+    """关客户端 —— 只关「每请求新建」的回退路径；共享单例留给进程退出收口。
+
+    这个分叉必须在 `_release_client` 里做：调用点（错误路径 / _Upstream.close）拿到的
+    可能正是共享单例，在那里无条件 `aclose()` 会在别的并发请求读流时把池子关掉。
+    """
+    if not _HTTP_REUSE:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 - 关连接失败不掩盖主流程
+            pass
+
+
+async def close_upstream_client() -> None:
+    """进程退出时关共享客户端（main.lifespan 收口）。"""
+    global _upstream_client
+    if _upstream_client is not None and not _upstream_client.is_closed:
+        await _upstream_client.aclose()
+    _upstream_client = None
+
+
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 
@@ -125,13 +180,130 @@ def _is_exhausted(status_code: int, text: str) -> bool:
 def _is_risk_control(status_code: int, text: str) -> bool:
     """风控信号判定（3012「unusual activity」/ messages 端点 405）。
 
-    与验证码挑战互斥：调用点已先排除 challenge 形态。命中即账号级风控，
-    需指数退避冷却，而非直接回传客户端错误（会导致下次立刻重打、加剧风控）。
+    与验证码挑战互斥：调用点已先排除 challenge 形态。命中后还要**判级**——
+    3012 有账号级与模型级两种语义，见下方 `_probe_risk_scope`。
     """
     if status_code in constants.RISK_CONTROL_HTTP_STATUSES:
         return True
     low = text.lower()
     return any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS)
+
+
+# ── 3012 判级 + 模型级熔断（2026-09-28 实证）──────────────────────────────────
+# 同一个 405+3012 承载两种语义，原实现只认第一种：
+#   账号级——账号被上游盯上，此时**任何**模型都 3012（热账号实测：连 Flash 也 3012）；
+#   模型级——该模型被上游策略拦下，账号完全健康（冷账号实测：GLM-5.3 → 3012，
+#           同一账号几秒后的 GLM-5.3-Flash → 200，正反两种顺序都复现）。
+# 把模型级也当账号级处置的代价：**每个 GLM-5.3 请求吃掉一个账号**。2026-09-28
+# 03:10:23–03:15:33 五个请求把 20 个号全打成 disabled，而它们对 Flash 全健康。
+#
+# 现在命中 3012 后用同账号补发一发 Flash 探针判级：
+#   探针 200       → 模型级：熔断该模型 MODEL_BLOCK_SECONDS，账号保持可用
+#   探针 3012/405  → 账号级：维持原行为（ban_for_risk，人工恢复，不自动解除）
+#   探针异常/其它码 → 判级无据：不封号（对齐「403 不再无条件判 invalid」的既有修正），
+#                    改冷却待复核——冷却会自愈，误封不会
+_model_block_until: dict[str, float] = {}
+
+
+def _model_key(model: object) -> str:
+    """模型名归一化成熔断键（大小写不敏感：上游对 glm-5.3/GLM-5.3 反应一致）。"""
+    return str(model or "").strip().lower()
+
+
+def model_block_remaining(model: object) -> int:
+    """该模型距熔断解除的剩余秒数（0 = 未熔断，顺带清掉过期条目）。"""
+    key = _model_key(model)
+    until = _model_block_until.get(key)
+    if not until:
+        return 0
+    remain = int(round(until - time.time()))
+    if remain <= 0:
+        _model_block_until.pop(key, None)
+        return 0
+    return remain
+
+
+def model_blocks() -> list[dict]:
+    """当前生效的模型熔断（管理端/监控展示用）。"""
+    out = []
+    for key in sorted(_model_block_until):
+        remain = model_block_remaining(key)
+        if remain:
+            out.append({"model": key, "remaining": remain})
+    return out
+
+
+def _block_model(model: object, reason: str) -> None:
+    key = _model_key(model)
+    if not key:
+        return
+    _model_block_until[key] = time.time() + settings.MODEL_BLOCK_SECONDS
+    logs.warn("model-block",
+              f"模型 {key} 熔断 {settings.MODEL_BLOCK_SECONDS}s（{reason}）")
+
+
+def reset_model_blocks() -> None:
+    """清空全部模型熔断（管理端手动解除 / 测试用例隔离）。"""
+    _model_block_until.clear()
+
+
+async def _probe_risk_scope(req_id: str, account: Account, port, slot_box: list | None) -> str:
+    """用同账号补发一发 Flash 探针，判定本次 3012 是账号级还是模型级。
+
+    返回 "model" / "account" / "unknown"。**探针自身失败一律 "unknown"** ——
+    判级无据时宁可走冷却（可自愈），也不要把健康账号永久封掉（不可自愈）。
+    """
+    _park_slot(slot_box)
+    try:
+        verify_param, verify_region = await captcha_manager.get_verify_param(port)
+    except Exception as err:  # noqa: BLE001
+        logs.warn(req_id, f"3012 判级探针取验证码失败: {err}")
+        return "unknown"
+    if not _reacquire_slot(account, slot_box):
+        logs.warn(req_id, "3012 判级探针等待后并发已满，判级无据")
+        return "unknown"
+
+    probe_body = {
+        "model": constants.RISK_PROBE_MODEL,
+        "max_tokens": constants.RISK_PROBE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": constants.RISK_PROBE_PROMPT}],
+    }
+    try:
+        url, headers, payload = build_request(account, probe_body, verify_param,
+                                              None, verify_region)
+        # 探针是非流式小请求：独立短超时客户端，不复用流式那条 read=None 的配置
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=20.0, read=30.0, write=20.0, pool=10.0)
+        ) as client:
+            resp = await client.post(url, headers=headers, content=payload)
+            status_code, text = resp.status_code, resp.text
+    except httpx.HTTPError as err:
+        logs.warn(req_id, f"3012 判级探针连接失败: {err}")
+        return "unknown"
+
+    if status_code < 400:
+        logs.warn(req_id, f"3012 判级探针 {constants.RISK_PROBE_MODEL} HTTP {status_code}"
+                          f" → 模型级拦截")
+        return "model"
+    if _is_risk_control(status_code, text):
+        logs.warn(req_id, f"3012 判级探针同样被拦（HTTP {status_code}）→ 账号级风控")
+        return "account"
+    logs.warn(req_id, f"3012 判级探针异常（HTTP {status_code}），判级无据")
+    return "unknown"
+
+
+def _model_block_response(model: object, remain: int):
+    """模型熔断中的统一对外响应：400 + 明确文案（客户端换模型，别重试）。"""
+    return JSONResponse(
+        {"error": {
+            "message": (f"上游已拦截模型 {model}（3012 unusual activity），"
+                        f"该模型当前熔断中（剩 {remain}s）；请改用其它模型"),
+            "type": "model_blocked",
+            "model": model,
+            "retry_after": remain,
+        }},
+        status_code=400,
+    )
 
 
 # ── HTTP 200 里的业务错误（线上实测 2026-09-26）───────────────────────────────
@@ -587,6 +759,16 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     limit = _limit()
     attempts = 0
 
+    # 模型级熔断：已知该模型被上游策略拦下，再打上游只是白烧验证码和账号
+    if provider == "zai":
+        remain = model_block_remaining(body.get("model"))
+        if remain:
+            logs.warn(req_id, f"模型 {body.get('model')} 处于熔断期（剩 {remain}s），"
+                              f"直接拒绝，不打上游")
+            reqlog.finish_error(req_id, f"model blocked: {body.get('model')}（剩 {remain}s）",
+                               status=400)
+            return _model_block_response(body.get("model"), remain)
+
     while attempts < MAX_ACCOUNT_ATTEMPTS:
         account = store.select(provider, skip_ids=tried)
         if account is None:
@@ -727,7 +909,7 @@ class _Upstream:
             return
         self._closed = True
         await self.cm.__aexit__(None, None, None)
-        await self.client.aclose()
+        await _release_client(self.client)
         if self.on_close is not None:
             try:
                 self.on_close()
@@ -774,8 +956,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         status 推导通道；回退通道自己的 429 重试预算独立计满后再换号）
       - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
         COOLING_SECONDS 并换下一个账号
-      - 风控（3012/405「unusual activity」真封禁）：直接禁用账号（UI 展示），
-        人工确认恢复后手动启用，不做自动退避
+      - 风控（3012/405「unusual activity」）：**先判级**再处置 —— Flash 探针
+        200 ⇒ 模型级（熔断该模型，账号保持可用）；探针同样 3012 ⇒ 账号级
+        （禁用账号，人工恢复）；探针异常 ⇒ 判级无据（冷却待复核，不封号）
     """
     captcha_retries = 0
     retries_429 = 0
@@ -811,12 +994,12 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        client = _client()
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
-            await client.aclose()
+            await _release_client(client)
             account.record_result(False, f"连接失败: {err}")
             # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
             if account.status in (Status.INVALID, Status.DISABLED):
@@ -846,7 +1029,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         if status_code >= 400:
             text = (preloaded if preloaded is not None else await resp.aread()).decode("utf-8", "ignore")
             await cm.__aexit__(None, None, None)
-            await client.aclose()
+            await _release_client(client)
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
@@ -860,9 +1043,45 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
-            # 风控（3012「unusual activity」/ 405）：真封禁 → 禁用账号，人工恢复。
-            # 必须先于 exhausted/其它错误判定，且不再重试（避免对封禁账号持续施压）。
+            # 风控（3012「unusual activity」/ 405）：先判级再决定处置。必须先于
+            # exhausted/其它错误判定，且账号级不再重试（避免对封禁账号持续施压）。
             if _is_risk_control(status_code, text):
+                scope = "account"
+                if settings.MODEL_BLOCK_PROBE and needs_captcha and not force_fallback:
+                    scope = await _probe_risk_scope(req_id, account, port, slot_box)
+
+                if scope == "model":
+                    # 模型级：探针证明账号健康 → 熔断模型，账号**不**动
+                    _block_model(model_name,
+                                 f"账号 {account.name} 命中 3012，Flash 探针 200")
+                    account.fail_count += 1
+                    account.last_error = (
+                        f"模型级拦截（3012）：{model_name} 已熔断 "
+                        f"{settings.MODEL_BLOCK_SECONDS}s，账号未禁用"
+                    )
+                    account.record_result(False, account.last_error)
+                    store.update_account(account)
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 对 {model_name} 命中 3012，"
+                        f"Flash 探针 200 → 模型级拦截（账号保持可用），"
+                        f"熔断 {model_name} {settings.MODEL_BLOCK_SECONDS}s",
+                    )
+                    reqlog.finish_error(
+                        req_id,
+                        f"model blocked: {model_name}（上游策略拦截，非账号风控）",
+                        status=400, t_first=time.time() - attempt_t0,
+                    )
+                    return _model_block_response(model_name, settings.MODEL_BLOCK_SECONDS)
+
+                if scope == "unknown":
+                    # 判级无据：冷却（可自愈）而不是封号（不可自愈）
+                    account.record_result(False, "3012 判级无据（探针异常），按冷却处理")
+                    _mark(account, Status.COOLING, "3012 判级无据（探针异常），冷却待复核")
+                    logs.warn(req_id, f"账号 {account.name} 3012 判级无据，"
+                                      f"冷却 {settings.COOLING_SECONDS}s 待复核（不封号）")
+                    return _NEXT_ACCOUNT
+
                 account.record_result(False, f"风控封禁 HTTP {status_code}（3012/unusual activity）")
                 account.ban_for_risk()
                 account.last_error = (
