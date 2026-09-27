@@ -121,6 +121,14 @@ RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
 # 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# ── 3012 判级 + 模型级熔断（2026-09-28 实证）──────────────────────────────────
+# 上游的 405+3012「unusual activity」有两种语义：账号级（账号被盯上）与模型级
+# （该模型被策略拦下、账号健康）。原实现只认前者，于是每个 GLM-5.3 请求都禁用掉
+# 一个账号（2026-09-28 03:10–03:15，五个请求抽干 20 个号）。
+# 现在命中 3012 后用同账号补发一发 Flash 探针判级；判为模型级则熔断该模型
+# MODEL_BLOCK_SECONDS，账号保持可用（详见 app/routes/gateway.py 顶部注释）。
+MODEL_BLOCK_PROBE = _int("ZCODE_MODEL_BLOCK_PROBE", 1)        # 0 = 关闭判级（退回"3012 一律封号"）
+MODEL_BLOCK_SECONDS = _int("ZCODE_MODEL_BLOCK_SECONDS", 900)  # 模型级熔断时长（到期自动再试一次）
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 上游连接复用（默认开）。关掉退回"每请求新建 AsyncClient"的旧行为 ——

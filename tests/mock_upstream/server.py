@@ -112,6 +112,9 @@ def build_app() -> FastAPI:
     app.state.calls: list[tuple[str, str, dict, bytes]] = []
     app.state.counters: dict[str, int] = {}      # 凭证前缀 → 调用次数
     app.state.sequences: dict[str, list[str]] = {}  # bind → scenario 队列（测试侧写入）
+    # 模型级 3012 形态（risk_control_3012_by_model 场景）：这些模型返 405+3012，
+    # 其余模型正常 —— 对齐 2026-09-28 实测（同账号同时刻 GLM-5.3 拦、Flash 放行）
+    app.state.risk_models: set[str] = {"GLM-5.3"}
 
     def _record(method: str, path: str, headers: dict, body: bytes) -> None:
         app.state.calls.append((method, path, headers, body))
@@ -240,6 +243,14 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "risk_control_3012_by_model":
+            # 2026-09-28 实测形态：**模型级**拦截 —— app.state.risk_models 里的模型
+            # 返 405+3012，其余模型同一账号同一时刻正常 200。判级探针（Flash）必须
+            # 落到后者，才能复现「账号级 ban 是误判」这条链。
+            blocked = getattr(app.state, "risk_models", None) or {"GLM-5.3"}
+            if payload.get("model") in blocked:
+                return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+            return 200, ok_body, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
         if scenario == "not_found":

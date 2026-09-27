@@ -345,6 +345,26 @@ class Store:
             self._persist_account(account)
             return True
 
+    def reset_risk_ban(self, provider: str, id_or_name: str) -> bool:
+        """解除风控封禁（人工复核后）：清 risk_strikes / last_error，复位 ACTIVE。
+
+        只认**风控封禁**形态（enabled=True 且 status=DISABLED）——那是 ban_for_risk
+        的签名，后台手动停用的账号（enabled=False）不在此列，绝不被这个动作顺手打开。
+        """
+        with self._lock:
+            account = self._find_locked(provider, id_or_name)
+            if not account:
+                return False
+            if not account.enabled or account.status != Status.DISABLED:
+                return False
+            account.status = Status.ACTIVE
+            account.risk_strikes = 0
+            account.last_error = None
+            account.cooling_until = None
+            account.exhausted_until = None
+            self._persist_account(account)
+            return True
+
     # ── 热路径落库（脏标记 + 合并刷写）────────────────────────────────────────
     # 成功路径曾对每个请求同步 update_account：全局 RLock + 新建 SQLite 连接 +
     # 全量 JSON 序列化 + commit，全在事件循环线程上 —— 并发下所有请求的收尾在

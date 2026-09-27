@@ -183,5 +183,16 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
         yield client, mock_app
 
 
+@pytest.fixture(autouse=True)
+def _reset_model_blocks():
+    """模型级熔断是 gateway 的**模块级内存态**（默认 15 分钟），跨用例会串味：
+    前一条用例熔断的模型会让后一条用例在 _dispatch 就被拦下。逐用例清空。"""
+    from app.routes import gateway as gateway_module
+
+    gateway_module.reset_model_blocks()
+    yield
+    gateway_module.reset_model_blocks()
+
+
 def seed_account(store, secret: str, name: str = "t"):
     return store.add_account("zai", name, secret)

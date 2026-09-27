@@ -623,7 +623,10 @@ async def import_accounts(payload: dict = Body(...)):
 @router.get("/monitoring")
 async def monitoring():
     """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
-    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
+    from .gateway import model_blocks
+
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP,
+            "model_blocks": model_blocks()}
 
 
 @router.get("/captcha/stats")
@@ -637,3 +640,48 @@ async def captcha_stats():
 async def monitoring_clear():
     reqlog.clear()
     return {"ok": True}
+
+
+# ── 模型级熔断（3012 判级的产物，内存态）─────────────────────────────────────
+@router.get("/model-blocks")
+async def list_model_blocks():
+    """当前被熔断的模型 + 剩余秒数。
+
+    熔断来自 3012 判级：上游把某个模型拦下（同账号 Flash 探针 200 证其健康），
+    网关熔断该模型而不是封账号。到期自动解除（届时再试一次，仍被拦会重新熔断）。
+    """
+    from .gateway import model_blocks
+
+    return {"blocks": model_blocks()}
+
+
+@router.post("/model-blocks/clear")
+async def clear_model_blocks():
+    """手动解除全部模型熔断（确认上游已恢复时用）。"""
+    from .gateway import model_blocks, reset_model_blocks
+
+    cleared = [b["model"] for b in model_blocks()]
+    reset_model_blocks()
+    return {"ok": True, "cleared": cleared}
+
+
+# ── 风控封禁复位（人工复核后批量放回）────────────────────────────────────────
+@router.post("/accounts/risk-reset")
+async def risk_reset(payload: dict = Body(default=None)):
+    """把风控封禁的账号复位（status→ACTIVE、risk_strikes=0、清 last_error）。
+
+    payload: {"ids": [...]}（缺省 = 全部处于风控封禁形态的账号）
+    enabled=False 的账号不在范围内（那是后台手动停用，不是风控封禁）。
+    """
+    payload = payload or {}
+    ids = payload.get("ids")
+    reset, skipped = [], []
+    for acc in store.list_accounts("zai") + store.list_accounts("bigmodel"):
+        if ids and acc.id not in ids:
+            continue
+        if store.reset_risk_ban(acc.provider, acc.id):
+            reset.append(acc.name)
+        elif ids:
+            skipped.append({"id": acc.id, "status": acc.status, "enabled": acc.enabled})
+    logs.warn("admin", f"风控封禁复位：{len(reset)} 个账号已放回")
+    return {"ok": True, "reset": reset, "skipped": skipped}
