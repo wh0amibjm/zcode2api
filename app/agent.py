@@ -18,10 +18,12 @@ _DROP_HEADERS = {
     "content-length",
     "x-api-key",
     "authorization",
-    # 验证码头归网关所有：客户端自带的 param 由 _client_captcha 读出后走
-    # verify_param 统一赋值。若不丢弃，merge 循环（在本函数后面跑）会用客户端
-    # 的小写 key 再塞一份 —— 与上方 CAPTCHA_HEADER 大写 key 大小写不同、dict
-    # 视为两个键，httpx 会把两条同名头都发出去，上游读到哪条看运气。
+    # 验证码头归网关所有：官方客户端只对 zcode.z.ai origin 注入（origin 门控，
+    # 见 docs/RESEARCH-official-captcha.md），打到网关的请求不会带；第三方若带了
+    # 也不可信，一律丢弃，最终值由 verify_param 统一赋值。若不丢弃，merge 循环
+    # （在本函数后面跑）会用客户端的小写 key 再塞一份 —— 与上方 CAPTCHA_HEADER
+    # 大写 key 大小写不同、dict 视为两个键，httpx 会把两条同名头都发出去，
+    # 上游读到哪条看运气。
     "x-aliyun-captcha-verify-param",
     "x-aliyun-captcha-verify-region",
     "user-agent",
