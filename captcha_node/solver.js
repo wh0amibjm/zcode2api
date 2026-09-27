@@ -170,6 +170,18 @@ function patchPeBundle(buf, url) {
   return Buffer.from(src, "utf8");
 }
 
+// ── 流量 dump（CAPTCHA_DUMP=<文件路径>）：给「纯协议复现」做明文取证 ─────────
+// 默认关；开了就把每次非 CDN 的上游交换（请求头/体 + 响应体）逐次落盘。
+// 里面含 deviceToken / securityToken 等一次性凭证，只在本机留档用。
+const DUMP_FILE = process.env.CAPTCHA_DUMP || "";
+let _dumpEntries = [];
+function dumpExchange(entry) {
+  if (!DUMP_FILE) return;
+  try {
+    _dumpEntries.push({ at: Date.now(), ...entry });
+    fs.writeFileSync(DUMP_FILE, JSON.stringify(_dumpEntries, null, 1), "utf8");
+  } catch (_) {}
+}
 // ── 每请求头注入（XHR/fetch/script 全走这里）────────────────────────────────
 function injectRequestHeaders(request) {
   const h = request.headers;
@@ -331,6 +343,14 @@ function makeInterceptor() {
         } catch (_) {}
         const res = await fetch(url, init);
         const buf = Buffer.from(await res.arrayBuffer());
+        dumpExchange({
+          method: request.method,
+          url,
+          reqHeaders: init.headers,
+          reqBody: hasBody ? Buffer.from(init.body).toString("utf8").slice(0, 8000) : "",
+          status: res.status,
+          respBody: buf.toString("utf8").slice(0, 8000),
+        });
         cookiesFromSetCookie(
           typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [],
           url,
