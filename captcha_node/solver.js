@@ -1366,9 +1366,47 @@ function simulateBehavior(w, durationMs = 600) {
   moveStep();
 }
 
-// ── cookie priming 缓存（对齐 zapi _cookieCache，5 分钟） ─────────────────────
+// ── cookie priming：磁盘 + 内存双缓存（5 分钟）──────────────────────────────
+// 对齐 zapi _cookieCache，但**必须落盘**：本求解器是一进程一解，模块级内存缓存
+// 在新进程里永远是冷的 —— 于是每一次求解都白付一跳 https://zcode.z.ai/。
+// 实测那一跳 2.5~4.0s，占单枚求解总时长（~7.9s）的 ~40%，是整条链路最大的单项。
+//
+// ZCODE_CAPTCHA_PRIME=0 直接跳过 priming：verifyParam 的有效性来自 SDK 自算的
+// DeviceData / securityToken，priming 抓来的 Set-Cookie 只是辅助字段 ——
+// 实测跳过后的 param 上游照收（HTTP 200 出话）。
 const COOKIE_CACHE_TTL_MS = 5 * 60 * 1000;
+const PRIME_CACHE_FILE = path.join(CDN_CACHE_DIR, "prime-cookies.json");
+const PRIME_DISABLED = /^(0|false|no|off)$/i.test(process.env.ZCODE_CAPTCHA_PRIME || "");
 let _cookieCache = { cookies: [], ts: 0 };
+
+function loadPrimingCookies() {
+  /** 可用的 priming cookie；返回 null = 缓存未命中，调用方去抓一次。 */
+  if (PRIME_DISABLED) return [];
+  const now = Date.now();
+  if (_cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
+    return _cookieCache.cookies;
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(PRIME_CACHE_FILE, "utf8"));
+    const ts = Number(raw && raw.ts) || 0;
+    const cookies = (raw && raw.cookies) || [];
+    if (Array.isArray(cookies) && cookies.length && now - ts < COOKIE_CACHE_TTL_MS) {
+      _cookieCache = { cookies, ts };
+      dbg(`prime: 磁盘命中（${cookies.length} 枚，age ${Math.round((now - ts) / 1000)}s）`);
+      return cookies;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function storePrimingCookies(cookies) {
+  _cookieCache = { cookies, ts: Date.now() };
+  try {
+    fs.mkdirSync(CDN_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(PRIME_CACHE_FILE, JSON.stringify(_cookieCache), "utf8");
+  } catch (_) {}
+  dbg(`prime: 抓取并落盘（${cookies.length} 枚）`);
+}
 
 // ── waitFor：轮询等待条件成立（initAliyunCaptcha 挂载） ──────────────────────
 function waitFor(cond, timeoutMs, intervalMs = 50) {
@@ -1396,11 +1434,9 @@ function waitFor(cond, timeoutMs, intervalMs = 50) {
 // 拦截器）→ WindowBrowserContext 取 cookieContainer → 预置 cookie → 装 polyfill/
 // 掩码/eval 探针（务必在 SDK 脚本执行前）→ document.write(HTML) → 挂 config。
 async function createDom(region, prefix) {
-  let cookies = [];
-  const now = Date.now();
-  if (_cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
-    cookies = _cookieCache.cookies;
-  } else {
+  let cookies = loadPrimingCookies();
+  if (cookies === null) {
+    cookies = [];
     try {
       const res = await fetch("https://zcode.z.ai/", {
         headers: {
@@ -1412,7 +1448,7 @@ async function createDom(region, prefix) {
         },
       });
       cookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-      _cookieCache = { cookies, ts: Date.now() };
+      storePrimingCookies(cookies);
     } catch (_) {}
   }
 
@@ -1578,6 +1614,8 @@ function handleCaptchaResult(result) {
 
 // ── main：单次求解 → 打印 VERIFY_PARAM= ─────────────────────────────────────
 async function main() {
+  const T0 = Date.now();          // 相位计时（CAPTCHA_DEBUG=1 时打印）
+  const phase = (n) => dbg(`phase ${n} +${Date.now() - T0}ms`);
   global.__requestLog = [];
   global.__cookieContainer = null;
   global.__browserFrame = null;
@@ -1586,6 +1624,7 @@ async function main() {
   const stallMs = Number(process.env.CAPTCHA_STALL_MS || 6_000);
 
   const dom = await createDom(REGION, PREFIX);
+  phase("createDom");
   const w = dom.window;
   const solveStart = Date.now();
 
@@ -1650,12 +1689,14 @@ async function main() {
           getInstance: (inst) => {
             try {
               (inst.startTracelessVerification || inst.show).call(inst);
+              phase("startTraceless");
             } catch (e) {
               finish(reject)(new Error(`start: ${e.message}`));
             }
           },
           success: (result) => {
             try {
+              phase("success");   // 单枚求解总时长 ≈ 这一行
               finish(resolve)(handleCaptchaResult(result));
             } catch (err) {
               finish(reject)(err);
